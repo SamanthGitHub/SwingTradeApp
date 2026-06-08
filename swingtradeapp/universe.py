@@ -140,6 +140,45 @@ class PreMarketScanner:
         movers = [r for r in rows.values() if abs(r["change_pct"]) >= min_change_pct]
         return sorted(movers, key=lambda r: abs(r["change_pct"]), reverse=True)[:top_n]
 
+    def fetch_afterhours_movers(self, top_n: int = 25, min_change_pct: float = 1.0) -> List[Dict[str, Any]]:
+        """Post-market (after-hours) movers via Yahoo's predefined screeners.
+
+        Mirrors ``fetch_movers`` but reads the ``postMarket*`` quote fields. These only populate
+        during/after the post-market session, so outside those hours the result is empty (the UI
+        shows a "session closed" message rather than stale numbers). Gainers and losers merged,
+        sorted by the magnitude of the after-hours move.
+        """
+        rows: Dict[str, Dict[str, Any]] = {}
+        try:
+            for screen in ("day_gainers", "day_losers", "most_actives"):
+                try:
+                    result = _yf_screen(screen, count=100)
+                except Exception:
+                    continue
+                quotes = result.get("quotes", []) if isinstance(result, dict) else []
+                for q in quotes:
+                    sym = q.get("symbol")
+                    if not sym or sym in rows:
+                        continue
+                    post_pct = q.get("postMarketChangePercent")
+                    if post_pct in (None, 0):
+                        continue
+                    rows[sym] = {
+                        "symbol": sym,
+                        "change_pct": float(post_pct),
+                        "session": "post-market",
+                        "price": q.get("postMarketPrice") or q.get("regularMarketPrice"),
+                        "regular_change_pct": q.get("regularMarketChangePercent"),
+                        "volume": q.get("regularMarketVolume"),
+                        "market_cap": q.get("marketCap"),
+                        "name": q.get("shortName") or q.get("longName") or sym,
+                    }
+        except Exception:
+            return []
+
+        movers = [r for r in rows.values() if abs(r["change_pct"]) >= min_change_pct]
+        return sorted(movers, key=lambda r: abs(r["change_pct"]), reverse=True)[:top_n]
+
     def fetch_gap_up_movers(self, symbols: List[str], top_n: int = 10) -> List[Dict[str, Any]]:
         """Fetch today's biggest gap-ups from a list of symbols."""
         movers = []

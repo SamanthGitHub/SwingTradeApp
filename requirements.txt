@@ -1,6 +1,7 @@
 # SwingTrade Pro — core runtime.
 # Installed into an isolated venv by run.sh / run.command (see README).
 streamlit>=1.30
+streamlit-option-menu>=0.3.6  # icon-based sidebar nav (graceful fallback to st.radio if absent)
 yfinance>=0.2.50
 pandas>=2.0
 numpy>=1.24

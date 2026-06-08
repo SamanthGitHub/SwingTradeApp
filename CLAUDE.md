@@ -1,7 +1,7 @@
 # CLAUDE.md — context for AI sessions (read this first, don't re-read everything)
 
 SwingTrade Pro: a Streamlit swing-trading dashboard. **Single entry point: `app.py`**
-(~1800 lines). Core logic in the `swingtradeapp/` package (19 modules). No tests yet.
+(~1900 lines). Core logic in the `swingtradeapp/` package (21 modules). No tests yet.
 
 ## Run / verify (ENVIRONMENT GOTCHAS — important)
 - **Launch:** `./run.sh` (or double-click `run.command`). Builds an isolated venv at
@@ -22,9 +22,17 @@ SwingTrade Pro: a Streamlit swing-trading dashboard. **Single entry point: `app.
   - import all modules: `... -c "import importlib,pkgutil,swingtradeapp; [importlib.import_module(f'swingtradeapp.{m.name}') for m in pkgutil.iter_modules(swingtradeapp.__path__)]"`
 
 ## Architecture
-- **app.py** `run_dashboard()` — sidebar nav pages: Screener · Pre-Market Movers ·
-  Auto Watchlist · ETF Screener · Market Events · Heat Map · Watchlists · Compare ·
-  P&L Tracker · Alerts · Settings. Cached singletons via `@st.cache_resource get_*`.
+- **app.py** `run_dashboard()` — sidebar nav pages: Screener · Pre-Market Movers · Live Movers ·
+  After-Hours & IPOs · Whale Movements · Options Flow · Predictions · Auto Watchlist · ETF
+  Screener · Market Events · Heat Map · Watchlists · Compare · P&L Tracker · Alerts · Settings.
+  Cached singletons via `@st.cache_resource get_*`.
+  (Live Movers = raw Yahoo predefined-screener passthrough via `get_raw_screen`/`fetch_raw_movers`
+  + `RAW_SCREENS` map — deliberately NO signals/filters, just "who's moving". Predictions =
+  next-session forecast via `predict_tomorrow` (PriceForecaster horizon=1, Chronos→heuristic
+  fallback) + a 5-session drill-down cone. After-Hours & IPOs = post-market movers via
+  `fetch_afterhours`→`PreMarketScanner.fetch_afterhours_movers` (Yahoo `postMarket*` fields; empty
+  outside ~4–8pm ET) + `ipo_table` over the curated `IPOTracker.RECENT_IPOS`. Options Flow =
+  single-ticker `analyze_options` + small cached `scan_options_flow`, both off `OptionsAnalyzer`.)
 - **swingtradeapp/**: `config`, `tickers` (live Nasdaq-Trader universe + yf screen actives),
   `universe`, `providers` (yfinance only), `signals` (`TrendSignalGenerator.build_signal`,
   has `min_score` param), `risk` (`BayesianKellySizer`, OOS-calibrated, shrinkage),
@@ -32,7 +40,15 @@ SwingTrade Pro: a Streamlit swing-trading dashboard. **Single entry point: `app.
   (Alpaca bracket), `fundamentals`, `macro_filters` (VIX/breadth/calendar; 2026 FOMC +
   programmatic Jobs/CPI), `watchlist`, `nlp` (sentiment + events + summary + novelty +
   news fetch), `forecast` (Chronos + heuristic MC fallback), `etf_screener`,
-  `options_analysis`, `multi_timeframe`, `market_structure`, `ipo_premarket`, `retry`.
+  `options_analysis` (IV rank/current-IV, put/call, unusual volume, Greeks, IV-crush — surfaced
+  on Options Flow), `multi_timeframe`, `market_structure`,
+  `ipo_premarket` (`IPOTracker.RECENT_IPOS` is a **curated, manually-maintained** list — refresh
+  periodically like the Fed calendar), `retry`,
+  `whale` (`WhaleDetector`: infers large-money footprints from daily OHLCV — relative-volume
+  surge + $ traded + closing strength → 0–100 whale score; pure/no-Streamlit, app.py owns the
+  cached universe loop `scan_whale_activity`),
+  `ui` (presentation: `inject_theme` global CSS, `render_header` branded band, `render_nav`
+  icon sidebar menu). `run_dashboard` calls these right after `set_page_config`.
 
 ## Key conventions
 - **Optional AI (Hugging Face)**: lazy-load, **graceful heuristic fallback**, gated by
@@ -47,6 +63,12 @@ SwingTrade Pro: a Streamlit swing-trading dashboard. **Single entry point: `app.
   Avoid (bearish). Colors via `_reco_color`; forecast via `_forecast_color`. Glossary:
   `_render_legend()` (an expander shown on label-heavy pages).
 - **Percentages: 2 decimals everywhere** (`{:.2f}%` / `{:.2%}`).
+- **UI/theme**: `swingtradeapp/ui.py` owns all styling. Theme is **mode-agnostic** (auto
+  light/dark) — `.streamlit/config.toml` sets only `primaryColor`/`font`/`baseRadius`; CSS uses
+  theme vars (`var(--secondary-background-color)`) / `@media (prefers-color-scheme)`, never a
+  hardcoded background. Nav = `streamlit-option-menu` (in `requirements.txt`) with graceful
+  fallback to `st.radio`. **`ui.NAV_ITEMS` labels must stay byte-identical to the `page == "…"`
+  branches** in `run_dashboard` — they're the routing keys.
 - **Universe**: `get_tradable_universe()` (Nasdaq Trader dirs, cached `.data/universe.json`,
   24h) + `get_screening_universe()` (today's most-actives first via `yf.screen`).
 - **Backtest realism (done)**: costs (`slippage_bps`/`commission_bps` in config),

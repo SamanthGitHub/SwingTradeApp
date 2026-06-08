@@ -19,7 +19,9 @@ from swingtradeapp.config import TradingConfig
 from swingtradeapp.etf_screener import ETFScreener
 from swingtradeapp.execution import AlpacaExecutionBridge, BracketOrder
 from swingtradeapp.fundamentals import FundamentalsExtractor
+from swingtradeapp.ipo_premarket import IPOTracker
 from swingtradeapp.macro_filters import MacroContext
+from swingtradeapp.options_analysis import OptionsAnalyzer
 from swingtradeapp.forecast import PriceForecaster, expected_return_pct, forecast_confirms
 from swingtradeapp.nlp import (
     FinBERTSentimentAnalyzer,
@@ -32,9 +34,11 @@ from swingtradeapp.providers import ProviderFactory
 from swingtradeapp.retry import with_retry
 from swingtradeapp.risk import BayesianKellySizer
 from swingtradeapp.signals import TrendSignalGenerator
-from swingtradeapp.tickers import get_screening_universe
+from swingtradeapp.tickers import get_raw_screen, get_screening_universe
+from swingtradeapp import ui
 from swingtradeapp.universe import PreMarketScanner, UniverseFilter
 from swingtradeapp.watchlist import WatchlistManager
+from swingtradeapp.whale import WhaleConfig, WhaleDetector
 
 # ── Cached singletons ──────────────────────────────────────────────────────────
 
@@ -69,6 +73,14 @@ def get_macro_context():
 @st.cache_resource
 def get_backtest_engine(config):
     return VectorBacktestEngine(config)
+
+@st.cache_resource
+def get_options_analyzer():
+    return OptionsAnalyzer()
+
+@st.cache_resource
+def get_ipo_tracker():
+    return IPOTracker()
 
 
 # ── Optional AI models (loaded lazily, only when the Settings toggle is on) ──────
@@ -152,6 +164,138 @@ def fetch_movers(top_n: int = 25, min_change_pct: float = 1.0) -> pd.DataFrame:
     """Live pre-market / session movers (cached 5 min)."""
     scanner = PreMarketScanner(get_config())
     return pd.DataFrame(scanner.fetch_movers(top_n=top_n, min_change_pct=min_change_pct))
+
+
+# Yahoo predefined screeners surfaced on the raw "who's moving" page (no logic, passthrough).
+RAW_SCREENS = {
+    "Most Actives": "most_actives",
+    "Day Gainers": "day_gainers",
+    "Day Losers": "day_losers",
+    "Small-Cap Gainers": "small_cap_gainers",
+    "Aggressive Small Caps": "aggressive_small_caps",
+    "Most Shorted": "most_shorted_stocks",
+}
+
+
+@st.cache_data(ttl=180)
+def fetch_raw_movers(predefined: str, count: int = 50) -> pd.DataFrame:
+    """Raw Yahoo screener feed as a tidy DataFrame — no filters, no signals (cached 3 min)."""
+    quotes = get_raw_screen(predefined, count=count)
+    rows = []
+    for q in quotes:
+        sym = q.get("symbol")
+        if not sym:
+            continue
+        rows.append({
+            "Symbol": sym,
+            "Name": q.get("shortName") or q.get("longName") or sym,
+            "Price": q.get("regularMarketPrice"),
+            "Change %": q.get("regularMarketChangePercent"),
+            "Pre-mkt %": q.get("preMarketChangePercent"),
+            "Volume": q.get("regularMarketVolume"),
+            "Avg Vol (3M)": q.get("averageDailyVolume3Month"),
+            "Mkt Cap": q.get("marketCap"),
+        })
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=300)
+def fetch_afterhours(top_n: int = 25, min_change_pct: float = 1.0) -> pd.DataFrame:
+    """Post-market (after-hours) movers (cached 5 min). Empty outside the post-market session."""
+    scanner = PreMarketScanner(get_config())
+    return pd.DataFrame(scanner.fetch_afterhours_movers(top_n=top_n, min_change_pct=min_change_pct))
+
+
+# ── Options analytics (single-ticker + small unusual-flow scan) ─────────────────
+
+@st.cache_data(ttl=900, show_spinner=False)
+def analyze_options(symbol: str) -> Dict:
+    """Per-ticker options snapshot: IV rank/level, put-call ratio, unusual flow, earnings/IV-crush.
+
+    Each field is best-effort and None-safe (live option chains are flaky). Cached 15 min.
+    """
+    oa = get_options_analyzer()
+    current_iv = oa.fetch_current_iv(symbol)
+    earn = oa.fetch_earnings_date(symbol)
+    return {
+        "iv_rank": oa.fetch_iv_rank(symbol),
+        "current_iv": current_iv,
+        "pc_ratio": oa.fetch_put_call_ratio_symbol(symbol),
+        "unusual": oa.detect_unusual_volume(symbol),
+        "earnings_date": earn,
+        "iv_crush": oa.estimate_iv_crush(symbol, current_iv) if current_iv else None,
+    }
+
+
+def _pc_sentiment(pc: Optional[float]) -> str:
+    """Put/call ratio → sentiment label. <0.70 call-heavy (bullish), >1.00 put-heavy (bearish)."""
+    if pc is None:
+        return "—"
+    if pc < 0.70:
+        return "Bullish"
+    if pc > 1.00:
+        return "Bearish"
+    return "Neutral"
+
+
+@st.cache_data(ttl=1200, show_spinner=False)
+def scan_options_flow(sample_size: int = 15) -> pd.DataFrame:
+    """Small, slow scan of the most-actives for options sentiment + unusual flow (cached 20 min).
+
+    Per symbol pulls the live nearest-expiry chain (put/call ratio) and flags unusual volume
+    (volume > 10% of open interest). Kept intentionally small — each symbol is a network round-trip.
+    """
+    oa = get_options_analyzer()
+    rows: List[Dict] = []
+    for sym in get_screen_universe()[:sample_size]:
+        try:
+            pc = oa.fetch_put_call_ratio_symbol(sym)
+            unusual = oa.detect_unusual_volume(sym)
+        except Exception:
+            continue
+        if pc is None and unusual is None:
+            continue
+        n_unusual = 0
+        signal = "—"
+        if unusual:
+            n_unusual = len(unusual.get("unusual_calls", [])) + len(unusual.get("unusual_puts", []))
+            signal = "calls" if unusual.get("signal") == "calls" else "puts"
+        rows.append({
+            "Symbol": sym,
+            "P/C Ratio": pc,
+            "Sentiment": _pc_sentiment(pc),
+            "Unusual": signal,
+            "# Unusual": n_unusual,
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(["# Unusual", "P/C Ratio"], ascending=[False, True]).reset_index(drop=True)
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def ipo_table() -> pd.DataFrame:
+    """Performance of the curated recent-IPO list (cached 1h). IPO price ≈ earliest available."""
+    tracker = get_ipo_tracker()
+    rows: List[Dict] = []
+    for sym, meta in tracker.RECENT_IPOS.items():
+        perf = tracker.fetch_ipo_performance(sym)
+        age = tracker.get_ipo_age(sym)
+        if perf is None:
+            continue
+        rows.append({
+            "Symbol": sym,
+            "Name": meta["name"],
+            "Days since IPO": age,
+            "IPO price ≈": perf["ipo_price_approx"],
+            "Current": perf["current_price"],
+            "Gain %": perf["gain_pct"],
+            "Phase": "early" if (age or 0) < 90 else "established",
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("Days since IPO").reset_index(drop=True)
+    return df
 
 
 def recommend_label(score: Optional[float], trend: str = "long") -> str:
@@ -244,6 +388,78 @@ def build_auto_watchlist(_config, top_n: int = 20, min_change_pct: float = 2.0,
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.sort_values("Score", ascending=False).reset_index(drop=True)
+    return df
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def predict_tomorrow(sample_size: int = 60) -> pd.DataFrame:
+    """Next-session (tomorrow) probabilistic price forecast across the most-active universe.
+
+    Runs the PriceForecaster at horizon=1 for each symbol: Chronos-Bolt when installed, else a
+    Monte-Carlo random-walk heuristic (always available). Surfaces the median predicted close,
+    the p10–p90 band, the implied next-day return %, and an uncertainty width. Sorted most-bullish
+    first. Cached 30 min. This is a probabilistic model output — not financial advice.
+    """
+    forecaster = get_forecaster()
+    universe = get_screen_universe()[:sample_size]
+    rows: List[Dict] = []
+    for sym in universe:
+        hist = fetch_symbol_history(sym, days=200)
+        if hist.empty or len(hist) < 40:
+            continue
+        fc = forecaster.forecast(_to_series(hist, "Close"), horizon=1)
+        if fc is None or not fc.get("last_price"):
+            continue
+        last = float(fc["last_price"])
+        p10, p50, p90 = float(fc["p10"][0]), float(fc["p50"][0]), float(fc["p90"][0])
+        ret = (p50 - last) / last * 100.0 if last else 0.0
+        band = (p90 - p10) / p50 * 100.0 if p50 else 0.0
+        rows.append({
+            "Symbol": sym,
+            "Price": last,
+            "Pred Close": p50,
+            "Pred Return %": ret,
+            "Direction": "Up" if p50 > last else ("Down" if p50 < last else "Flat"),
+            "Low (p10)": p10,
+            "High (p90)": p90,
+            "Uncertainty %": band,
+            "Model": fc["source"],
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("Pred Return %", ascending=False).reset_index(drop=True)
+    return df
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def scan_whale_activity(sample_size: int = 120, min_rvol: float = 2.0,
+                        min_dollar_vol_m: float = 50.0) -> pd.DataFrame:
+    """Scan the most-active universe for large-money ("whale") footprints (cached 10 min).
+
+    For each symbol we pull recent daily OHLCV and ask the WhaleDetector whether the latest
+    bar is an outsized volume event (relative volume ≥ ``min_rvol`` AND ≥ ``min_dollar_vol_m``
+    $M traded), then tag it Heavy Buying / Heavy Selling / Accumulation / Distribution / Churn
+    with a 0–100 whale score. Most-active names come first so the scan favors where the size is.
+    """
+    detector = WhaleDetector(WhaleConfig(min_rvol=min_rvol,
+                                         min_dollar_vol=min_dollar_vol_m * 1e6))
+    universe = get_screen_universe()[:sample_size]
+    rows: List[Dict] = []
+    for sym in universe:
+        hist = fetch_symbol_history(sym, days=60)
+        if hist.empty or len(hist) < 24 or "Volume" not in hist.columns:
+            continue
+        closes = _to_series(hist, "Close")
+        volumes = _to_series(hist, "Volume")
+        highs = _to_series(hist, "High") if "High" in hist.columns else closes
+        lows = _to_series(hist, "Low") if "Low" in hist.columns else closes
+        opens = _to_series(hist, "Open") if "Open" in hist.columns else closes
+        res = detector.analyze(sym, opens, highs, lows, closes, volumes)
+        if res is not None:
+            rows.append(res)
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("whale_score", ascending=False).reset_index(drop=True)
     return df
 
 
@@ -1007,20 +1223,13 @@ def close_trade(trades: List[Dict], trade_id: int, exit_price: float) -> None:
 def run_dashboard() -> None:
     st.set_page_config(
         page_title="SwingTrade Pro Dashboard",
+        page_icon="📈",
         layout="wide",
         initial_sidebar_state="expanded",
     )
 
-    st.markdown("""
-    <style>
-    .stTabs [data-baseweb="tab-list"] button { font-size: 15px; font-weight: 600; }
-    .metric-positive { color: #00c851; font-weight: bold; }
-    .metric-negative { color: #ff4444; font-weight: bold; }
-    </style>
-    """, unsafe_allow_html=True)
-
-    st.title("SwingTrade Pro — AI-Powered Trading Dashboard")
-    st.markdown("Multi-factor signals · Backtested edge · Dynamic Kelly sizing · Real-time alerts")
+    ui.inject_theme()
+    ui.render_header()
 
     config = get_config()
     # Apply live cost-model overrides set on the Settings page (survive cache clears).
@@ -1028,13 +1237,13 @@ def run_dashboard() -> None:
         config.slippage_bps = st.session_state["slippage_bps"]
         config.commission_bps = st.session_state["commission_bps"]
     watchlist_mgr = get_watchlist_manager()
-    account_size = float(st.sidebar.number_input("Account size ($)", value=100_000, step=10_000, min_value=1000))
+
+    page = ui.render_nav()
 
     with st.sidebar:
-        st.header("Navigation")
-        page = st.radio("", ["Screener", "Pre-Market Movers", "Auto Watchlist", "ETF Screener",
-                              "Market Events", "Heat Map", "Watchlists", "Compare", "P&L Tracker",
-                              "Alerts", "Settings"])
+        st.divider()
+        account_size = float(st.number_input("Account size ($)", value=100_000, step=10_000,
+                                             min_value=1000))
 
     # ═══════════════════════ SCREENER ════════════════════════════════════════
     if page == "Screener":
@@ -1268,6 +1477,493 @@ def run_dashboard() -> None:
                                   labels={"change_pct": "% move", "symbol": ""})
                     lfig.update_layout(height=380, showlegend=False, coloraxis_showscale=False)
                     st.plotly_chart(lfig, use_container_width=True)
+
+    # ═══════════════════════ LIVE MOVERS (RAW) ═══════════════════════════════
+    elif page == "Live Movers":
+        st.header("⚡ Live Movers")
+        st.caption("Raw Yahoo Finance screener feed — no filters, no signals, no recommendations. "
+                   "Just who's moving right now. Pick a screener and look.")
+
+        lc1, lc2, lc3 = st.columns([2, 1, 1])
+        with lc1:
+            screen_name = st.selectbox("Screener", list(RAW_SCREENS.keys()))
+        with lc2:
+            lm_count = st.slider("How many", 10, 100, 50, 10)
+        with lc3:
+            st.write("")
+            if st.button("↻ Refresh now"):
+                fetch_raw_movers.clear()
+
+        with st.spinner(f"Fetching {screen_name}…"):
+            raw = fetch_raw_movers(RAW_SCREENS[screen_name], count=lm_count)
+
+        if raw.empty:
+            st.warning("No data returned — the screener feed may be unavailable right now.")
+        else:
+            st.caption(f"{len(raw)} names · live from Yahoo Finance · cached up to 3 min")
+
+            def _chg(v):
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    return ""
+                return "color:#00c851" if v > 0 else ("color:#ff4444" if v < 0 else "")
+
+            st.dataframe(
+                raw.style.format({
+                    "Price": "${:.2f}", "Change %": "{:+.2f}%", "Pre-mkt %": "{:+.2f}%",
+                    "Volume": "{:,.0f}", "Avg Vol (3M)": "{:,.0f}", "Mkt Cap": "${:,.0f}",
+                }, na_rep="—").map(_chg, subset=["Change %", "Pre-mkt %"]),
+                use_container_width=True, height=560,
+            )
+
+    # ═══════════════════════ AFTER-HOURS & IPOs ══════════════════════════════
+    elif page == "After-Hours & IPOs":
+        st.header("🌙 After-Hours & IPOs")
+        st.caption("Post-market movers (extended-hours gappers that often set up the next session) "
+                   "and a tracker for notable recent IPOs.")
+
+        st.subheader("After-Hours Movers")
+        ah1, ah2, ah3 = st.columns(3)
+        with ah1:
+            ah_n = st.slider("Show top", 10, 50, 25, 5, key="ah_n")
+        with ah2:
+            ah_min = st.slider("Min move %", 0.0, 10.0, 1.0, 0.5, key="ah_min")
+        with ah3:
+            st.write("")
+            if st.button("↻ Refresh now", key="ah_refresh"):
+                fetch_afterhours.clear()
+
+        with st.spinner("Fetching after-hours movers…"):
+            ah = fetch_afterhours(top_n=ah_n, min_change_pct=ah_min)
+
+        if ah.empty:
+            st.info("No after-hours movers right now — the post-market session is likely closed "
+                    "(it runs ~4–8pm ET). Yahoo only reports post-market quotes during/after that "
+                    "window.")
+        else:
+            ah_g = ah[ah["change_pct"] > 0]
+            ah_l = ah[ah["change_pct"] < 0]
+            s1, s2, s3 = st.columns(3)
+            s1.metric("AH Gainers", len(ah_g))
+            s2.metric("AH Losers", len(ah_l))
+            s3.metric("Biggest move", f"{ah['change_pct'].abs().max():.2f}%")
+
+            ah_disp = ah.rename(columns={
+                "symbol": "Symbol", "name": "Name", "change_pct": "AH %",
+                "price": "AH Price", "regular_change_pct": "Reg %",
+                "volume": "Volume", "market_cap": "Mkt Cap",
+            })[["Symbol", "Name", "AH %", "AH Price", "Reg %", "Volume", "Mkt Cap"]]
+
+            def _hl_ah(v):
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    return ""
+                return "color:#00c851" if v > 0 else ("color:#ff4444" if v < 0 else "")
+
+            st.dataframe(
+                ah_disp.style.format({
+                    "AH %": "{:+.2f}%", "AH Price": "${:.2f}", "Reg %": "{:+.2f}%",
+                    "Volume": "{:,.0f}", "Mkt Cap": "${:,.0f}",
+                }, na_rep="—").map(_hl_ah, subset=["AH %", "Reg %"]),
+                use_container_width=True, height=440,
+            )
+
+            agl, agr = st.columns(2)
+            with agl:
+                st.markdown("**Top AH Gainers**")
+                if not ah_g.empty:
+                    gfig = px.bar(ah_g.head(12).sort_values("change_pct"),
+                                  x="change_pct", y="symbol", orientation="h",
+                                  color="change_pct", color_continuous_scale="Greens",
+                                  labels={"change_pct": "AH %", "symbol": ""})
+                    gfig.update_layout(height=360, showlegend=False, coloraxis_showscale=False)
+                    st.plotly_chart(gfig, use_container_width=True, key="ah_up")
+            with agr:
+                st.markdown("**Top AH Losers**")
+                if not ah_l.empty:
+                    lfig = px.bar(ah_l.head(12).sort_values("change_pct", ascending=False),
+                                  x="change_pct", y="symbol", orientation="h",
+                                  color="change_pct", color_continuous_scale="Reds_r",
+                                  labels={"change_pct": "AH %", "symbol": ""})
+                    lfig.update_layout(height=360, showlegend=False, coloraxis_showscale=False)
+                    st.plotly_chart(lfig, use_container_width=True, key="ah_dn")
+
+        st.markdown("---")
+        st.subheader("Recent IPOs")
+        st.caption("Curated list of notable recent IPOs. **IPO price is approximate** — the earliest "
+                   "close yfinance returns (~2y of history), not the true offer price.")
+        with st.spinner("Loading IPO performance…"):
+            ipos = ipo_table()
+        if ipos.empty:
+            st.warning("IPO performance data is unavailable right now.")
+        else:
+            def _hl_gain(v):
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    return ""
+                return "color:#00c851" if v > 0 else ("color:#ff4444" if v < 0 else "")
+
+            st.dataframe(
+                ipos.style.format({
+                    "IPO price ≈": "${:.2f}", "Current": "${:.2f}",
+                    "Gain %": "{:+.2f}%", "Days since IPO": "{:,.0f}",
+                }, na_rep="—").map(_hl_gain, subset=["Gain %"]),
+                use_container_width=True, height=460,
+            )
+
+        with st.expander("🔎 Look up any ticker's run since its earliest data"):
+            ip_sym = st.text_input("Symbol", key="ipo_lookup").strip().upper()
+            if ip_sym:
+                perf = get_ipo_tracker().fetch_ipo_performance(ip_sym)
+                if perf:
+                    ic1, ic2, ic3 = st.columns(3)
+                    ic1.metric("Earliest close ≈", f"${perf['ipo_price_approx']:.2f}")
+                    ic2.metric("Current", f"${perf['current_price']:.2f}")
+                    ic3.metric("Change", f"{perf['gain_pct']:+.2f}%")
+                    st.caption("⚠️ 'Earliest close' is the oldest price in ~2y of history — a rough "
+                               "IPO-price proxy only for stocks that listed within that window.")
+                else:
+                    st.info("No history available for that symbol.")
+
+    # ═══════════════════════ WHALE MOVEMENTS ═════════════════════════════════
+    elif page == "Whale Movements":
+        st.header("🐋 Whale Movements")
+        st.caption("Large-money footprints inferred from the public tape: names trading on an "
+                   "outsized volume surge vs their own 20-day baseline, scaled by the dollars "
+                   "changing hands and where the day closed in its range. No dark-pool / Level 2 "
+                   "data — this is smart-money *inference* from free Yahoo Finance OHLCV.")
+
+        wc1, wc2, wc3, wc4 = st.columns(4)
+        with wc1:
+            w_n = st.slider("Universe size", 40, 250, 120, 20,
+                            help="Most-active names are scanned first")
+        with wc2:
+            w_rvol = st.slider("Min relative volume", 1.5, 8.0, 2.0, 0.5,
+                               help="Today's volume vs its 20-day average")
+        with wc3:
+            w_dollar = st.slider("Min $ traded ($M)", 10, 500, 50, 10,
+                                 help="Minimum dollar volume to count as whale size")
+        with wc4:
+            st.write("")
+            if st.button("↻ Refresh now"):
+                scan_whale_activity.clear()
+
+        with st.spinner("Scanning the tape for whale activity…"):
+            whales = scan_whale_activity(sample_size=w_n, min_rvol=w_rvol,
+                                         min_dollar_vol_m=float(w_dollar))
+
+        if whales.empty:
+            st.info("No whale-sized volume events right now. Lower the relative-volume or "
+                    "$-traded thresholds, or widen the universe.")
+        else:
+            buying = whales[whales["signal"].isin(["Heavy Buying", "Accumulation"])]
+            selling = whales[whales["signal"].isin(["Heavy Selling", "Distribution"])]
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Whale events", len(whales))
+            m2.metric("Bullish footprints", len(buying))
+            m3.metric("Bearish footprints", len(selling))
+            m4.metric("Top $ traded", f"${whales['dollar_vol'].max()/1e6:,.0f}M")
+
+            disp = whales.rename(columns={
+                "symbol": "Symbol", "signal": "Signal", "whale_score": "Whale Score",
+                "rvol": "Rel Vol", "price": "Price", "change_pct": "Change %",
+                "dollar_vol": "$ Traded", "close_strength": "Close Str",
+                "accum_days": "Accum d", "distrib_days": "Distrib d",
+            })[["Symbol", "Signal", "Whale Score", "Rel Vol", "Price", "Change %",
+                "$ Traded", "Close Str", "Accum d", "Distrib d"]]
+
+            def _whale_sig_color(v: str) -> str:
+                if v in ("Heavy Buying", "Accumulation"):
+                    return "color:#00c851;font-weight:bold" if v == "Heavy Buying" else "color:#00c851"
+                if v in ("Heavy Selling", "Distribution"):
+                    return "color:#ff4444;font-weight:bold" if v == "Heavy Selling" else "color:#ff4444"
+                return "color:#888888"
+
+            def _chg_color(v):
+                return "color:#00c851" if v > 0 else ("color:#ff4444" if v < 0 else "")
+
+            st.dataframe(
+                disp.style.format({
+                    "Whale Score": "{:.1f}", "Rel Vol": "{:.2f}x", "Price": "${:.2f}",
+                    "Change %": "{:+.2f}%", "$ Traded": "${:,.0f}", "Close Str": "{:.2f}",
+                }, na_rep="—")
+                .map(_whale_sig_color, subset=["Signal"])
+                .map(_chg_color, subset=["Change %"]),
+                use_container_width=True, height=520,
+            )
+
+            bub = whales.copy()
+            bub["dollar_vol_m"] = bub["dollar_vol"] / 1e6
+            bfig = px.scatter(
+                bub, x="rvol", y="change_pct", size="dollar_vol_m", color="signal",
+                hover_name="symbol", size_max=46,
+                labels={"rvol": "Relative volume (×)", "change_pct": "Day change %",
+                        "dollar_vol_m": "$ traded (M)", "signal": "Signal"},
+                color_discrete_map={
+                    "Heavy Buying": "#00c851", "Accumulation": "#7cd992",
+                    "Heavy Selling": "#ff4444", "Distribution": "#ff8a80", "Churn": "#9e9e9e",
+                },
+                title="Whale map — volume surge vs price impact (bubble = $ traded)",
+            )
+            bfig.add_hline(y=0, line_dash="dot", line_color="#888")
+            bfig.update_layout(height=440, margin=dict(t=46, l=10, r=10, b=10))
+            st.plotly_chart(bfig, use_container_width=True, key="whale_bubble")
+
+            with st.expander("How to read this"):
+                st.markdown(
+                    "- **Heavy Buying / Accumulation** — big volume on an up day; whales likely "
+                    "building positions. Heavy = closed in the top third of the day's range.\n"
+                    "- **Heavy Selling / Distribution** — big volume on a down day; likely "
+                    "offloading. Heavy = closed in the bottom third.\n"
+                    "- **Churn** — outsized volume but the close reverses the day's range "
+                    "(indecision / two-sided fight).\n"
+                    "- **Rel Vol** — today's volume ÷ its 20-day average (2.00x = double normal).\n"
+                    "- **Close Str** — where the close sat in the day's range (1.00 = on the high, "
+                    "0.00 = on the low).\n"
+                    "- **Accum d / Distrib d** — high-volume up vs down days over the last 20 "
+                    "sessions (the multi-day balance behind the latest bar)."
+                )
+
+    # ═══════════════════════ OPTIONS FLOW ════════════════════════════════════
+    elif page == "Options Flow":
+        st.header("🎯 Options Flow")
+        st.caption("Options-derived sentiment from live chains: IV rank, put/call ratio, and "
+                   "unusual volume (a contract trading above 10% of its open interest = possible "
+                   "smart-money positioning). Plus an earnings IV-crush estimate and a Greeks calc.")
+
+        # ── Single-ticker analysis ──────────────────────────────────────────
+        oc1, oc2 = st.columns([3, 1])
+        with oc1:
+            opt_sym = st.text_input("🔍 Analyze a ticker's options", placeholder="e.g. AAPL, NVDA",
+                                    key="opt_search").strip().upper()
+        with oc2:
+            st.write("")
+            do_opt = st.button("Analyze", use_container_width=True, key="opt_btn")
+
+        if opt_sym and (do_opt or st.session_state.get("opt_last") == opt_sym):
+            st.session_state["opt_last"] = opt_sym
+            with st.spinner(f"Pulling option chains for {opt_sym}…"):
+                od = analyze_options(opt_sym)
+
+            gcol, mcol = st.columns([1, 1])
+            with gcol:
+                if od["iv_rank"] is not None:
+                    ivfig = go.Figure(go.Indicator(
+                        mode="gauge+number", value=od["iv_rank"],
+                        title={"text": "IV Rank"},
+                        gauge={"axis": {"range": [0, 100]}, "bar": {"color": "#333"},
+                               "steps": [
+                                   {"range": [0, 30], "color": "#9ccc65"},
+                                   {"range": [30, 70], "color": "#ffe066"},
+                                   {"range": [70, 100], "color": "#ff4444"}]},
+                    ))
+                    ivfig.update_layout(height=260, margin=dict(t=50, l=30, r=30, b=10))
+                    st.plotly_chart(ivfig, use_container_width=True, key=f"iv_gauge_{opt_sym}")
+                    st.caption("Low IV (<30) = cheaper premiums (favor buying); High IV (>70) = "
+                               "expensive (favor selling).")
+                else:
+                    st.info("IV rank unavailable (no options chain for this symbol).")
+            with mcol:
+                pc = od["pc_ratio"]
+                sent = _pc_sentiment(pc)
+                sent_color = {"Bullish": "#00c851", "Bearish": "#ff4444"}.get(sent, "#888888")
+                st.metric("Put/Call ratio", f"{pc:.2f}" if pc is not None else "—")
+                st.markdown(f"Sentiment: <span style='color:{sent_color};font-weight:bold'>{sent}"
+                            f"</span>", unsafe_allow_html=True)
+                st.caption("<0.70 call-heavy (bullish) · >1.00 put-heavy (bearish)")
+                if od["current_iv"] is not None:
+                    st.metric("Current IV", f"{od['current_iv'] * 100:.2f}%")
+                crush = od["iv_crush"]
+                if crush:
+                    st.metric("Days to earnings", f"{crush['days_to_earnings']}")
+                    st.caption(f"Implied move ≈ ±{crush['estimated_move_pct'] * 100:.2f}% · "
+                               f"est. IV crush ≈ {crush['iv_crush_pct']:.0f}% post-earnings")
+                elif od["earnings_date"]:
+                    st.caption(f"Next earnings: {od['earnings_date']:%Y-%m-%d}")
+
+            unusual = od["unusual"]
+            if unusual and (unusual.get("unusual_calls") or unusual.get("unusual_puts")):
+                st.markdown("#### Unusual options activity")
+                ucol, pcol = st.columns(2)
+                with ucol:
+                    st.markdown("**Calls** (vol > 10% of OI)")
+                    uc = pd.DataFrame(unusual.get("unusual_calls", []))
+                    if not uc.empty:
+                        st.dataframe(uc[["strike", "volume", "openInterest"]].rename(columns={
+                            "strike": "Strike", "volume": "Volume", "openInterest": "Open Int"}),
+                            use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("None")
+                with pcol:
+                    st.markdown("**Puts** (vol > 10% of OI)")
+                    up = pd.DataFrame(unusual.get("unusual_puts", []))
+                    if not up.empty:
+                        st.dataframe(up[["strike", "volume", "openInterest"]].rename(columns={
+                            "strike": "Strike", "volume": "Volume", "openInterest": "Open Int"}),
+                            use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("None")
+            else:
+                st.caption("No unusual options volume detected on the nearest expiration.")
+
+            with st.expander("🧮 Greeks calculator (Black-Scholes call)"):
+                spot = (fetch_symbol_info(opt_sym).get("price")) or 100.0
+                seed_iv = od["current_iv"] if od["current_iv"] else 0.30
+                seed_iv_pct = min(300.0, max(1.0, round(seed_iv * 100, 1)))
+                gk1, gk2, gk3 = st.columns(3)
+                with gk1:
+                    g_strike = st.number_input("Strike $", value=float(round(spot, 2)), step=1.0,
+                                               key="g_strike")
+                with gk2:
+                    g_dte = st.number_input("Days to expiry", 1, 730, 30, key="g_dte")
+                with gk3:
+                    g_iv = st.number_input("IV (%)", 1.0, 300.0, float(seed_iv_pct),
+                                           step=1.0, key="g_iv") / 100.0
+                greeks = get_options_analyzer().estimate_greeks(
+                    opt_sym, float(spot), float(g_strike), int(g_dte), float(g_iv))
+                if greeks:
+                    e1, e2, e3, e4, e5 = st.columns(5)
+                    e1.metric("Call price", f"${greeks['call_price']:.2f}")
+                    e2.metric("Delta", f"{greeks['delta']:.3f}")
+                    e3.metric("Gamma", f"{greeks['gamma']:.4f}")
+                    e4.metric("Vega", f"{greeks['vega']:.3f}")
+                    e5.metric("Theta", f"{greeks['theta']:.3f}")
+                    st.caption(f"Spot ${spot:.2f} · simplified estimate, not a pricing engine.")
+
+        st.markdown("---")
+
+        # ── Unusual-flow scan across the most-actives ───────────────────────
+        st.subheader("Unusual flow scan")
+        st.caption("Scans the most-active names for options sentiment + unusual volume. **Slow** — "
+                   "each symbol pulls a live option chain — so it's a small sample, cached 20 min.")
+        sf1, sf2 = st.columns([1, 1])
+        with sf1:
+            sf_n = st.slider("Symbols to scan", 5, 30, 15, 5)
+        with sf2:
+            st.write("")
+            if st.button("↻ Rescan", key="of_refresh"):
+                scan_options_flow.clear()
+
+        with st.spinner("Scanning live option chains…"):
+            flow = scan_options_flow(sample_size=sf_n)
+
+        if flow.empty:
+            st.info("No options data returned for the scanned names right now.")
+        else:
+            def _sent_color(v: str) -> str:
+                if v == "Bullish":
+                    return "color:#00c851;font-weight:bold"
+                if v == "Bearish":
+                    return "color:#ff4444;font-weight:bold"
+                return "color:#888888"
+
+            st.dataframe(
+                flow.style.format({"P/C Ratio": "{:.2f}", "# Unusual": "{:,.0f}"}, na_rep="—")
+                .map(_sent_color, subset=["Sentiment"]),
+                use_container_width=True, height=440,
+            )
+
+    # ═══════════════════════ PREDICTIONS (TOMORROW) ══════════════════════════
+    elif page == "Predictions":
+        st.header("🔮 Predictions for Tomorrow")
+        st.caption("Next-session probabilistic price forecast for the most-active names. Uses "
+                   "Amazon Chronos when the AI extras are installed, otherwise a Monte-Carlo "
+                   "random-walk from recent returns. Shows the median predicted close, the "
+                   "p10–p90 range, and the implied next-day return. **Model output, not advice.**")
+
+        pc1, pc2, pc3 = st.columns([1, 1, 1])
+        with pc1:
+            pr_n = st.slider("Universe size", 20, 150, 60, 10,
+                             help="Most-active names are scanned first")
+        with pc2:
+            pr_dir = st.selectbox("Show", ["All", "Bullish only", "Bearish only"])
+        with pc3:
+            st.write("")
+            if st.button("↻ Refresh now"):
+                predict_tomorrow.clear()
+
+        with st.spinner("Forecasting tomorrow's moves…"):
+            preds = predict_tomorrow(sample_size=pr_n)
+
+        if preds.empty:
+            st.warning("No forecasts available right now — the data feed may be unavailable.")
+        else:
+            view = preds
+            if pr_dir == "Bullish only":
+                view = preds[preds["Pred Return %"] > 0]
+            elif pr_dir == "Bearish only":
+                view = preds[preds["Pred Return %"] < 0]
+
+            ups = int((preds["Pred Return %"] > 0).sum())
+            downs = int((preds["Pred Return %"] < 0).sum())
+            model = preds["Model"].mode().iloc[0] if not preds.empty else "—"
+            pm1, pm2, pm3, pm4 = st.columns(4)
+            pm1.metric("Forecasts", len(preds))
+            pm2.metric("Predicted up", ups)
+            pm3.metric("Predicted down", downs)
+            pm4.metric("Model", "Chronos AI" if model == "chronos" else "Heuristic MC")
+            if model != "chronos":
+                st.caption("💡 Install the AI extras (`pip install -r requirements-ai.txt`) to use "
+                           "the Chronos foundation model instead of the heuristic.")
+
+            def _dir_color(v: str) -> str:
+                if v == "Up":
+                    return "color:#00c851;font-weight:bold"
+                if v == "Down":
+                    return "color:#ff4444;font-weight:bold"
+                return "color:#888888"
+
+            def _ret_color(v):
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    return ""
+                return "color:#00c851" if v > 0 else ("color:#ff4444" if v < 0 else "")
+
+            st.dataframe(
+                view.style.format({
+                    "Price": "${:.2f}", "Pred Close": "${:.2f}", "Pred Return %": "{:+.2f}%",
+                    "Low (p10)": "${:.2f}", "High (p90)": "${:.2f}", "Uncertainty %": "{:.2f}%",
+                }, na_rep="—")
+                .map(_dir_color, subset=["Direction"])
+                .map(_ret_color, subset=["Pred Return %"]),
+                use_container_width=True, height=480,
+            )
+
+            tcol, bcol = st.columns(2)
+            with tcol:
+                st.subheader("Top predicted gainers")
+                top_up = preds[preds["Pred Return %"] > 0].head(12)
+                if not top_up.empty:
+                    ufig = px.bar(top_up.sort_values("Pred Return %"),
+                                  x="Pred Return %", y="Symbol", orientation="h",
+                                  color="Pred Return %", color_continuous_scale="Greens",
+                                  labels={"Pred Return %": "Pred. next-day %", "Symbol": ""})
+                    ufig.update_layout(height=380, showlegend=False, coloraxis_showscale=False)
+                    st.plotly_chart(ufig, use_container_width=True, key="pred_up")
+            with bcol:
+                st.subheader("Top predicted losers")
+                top_dn = preds[preds["Pred Return %"] < 0].tail(12)
+                if not top_dn.empty:
+                    dfig = px.bar(top_dn.sort_values("Pred Return %", ascending=False),
+                                  x="Pred Return %", y="Symbol", orientation="h",
+                                  color="Pred Return %", color_continuous_scale="Reds_r",
+                                  labels={"Pred Return %": "Pred. next-day %", "Symbol": ""})
+                    dfig.update_layout(height=380, showlegend=False, coloraxis_showscale=False)
+                    st.plotly_chart(dfig, use_container_width=True, key="pred_dn")
+
+            # ── Drill-down: forecast cone for one ticker (next 5 sessions for context) ──
+            st.markdown("---")
+            st.subheader("Inspect a forecast")
+            insp = st.selectbox("Ticker", view["Symbol"].tolist(), key="pred_inspect")
+            if insp:
+                fc5 = forecast_symbol(insp, horizon=5)
+                if fc5:
+                    st.plotly_chart(create_forecast_chart(insp, fc5),
+                                    use_container_width=True, key=f"pred_cone_{insp}")
+                    er = expected_return_pct(fc5)
+                    st.caption(f"5-session median path · expected return {er:+.2f}% · "
+                               f"source: {fc5['source']}")
+                else:
+                    st.info("Not enough history to chart a forecast for this ticker.")
+
+            st.caption("⚠️ Forecasts are probabilistic and frequently wrong, especially around "
+                       "news/earnings. Use as one input, not a guarantee.")
 
     # ═══════════════════════ AUTO WATCHLIST ══════════════════════════════════
     elif page == "Auto Watchlist":

@@ -19,12 +19,11 @@ class OptionsAnalyzer:
 
     # ── IV Analysis ────────────────────────────────────────────────────────────
 
-    def fetch_iv_rank(self, symbol: str) -> Optional[float]:
-        """
-        Calculate IV Rank: where is current IV vs 52-week range?
-        IV Rank = (Current IV - 52w Low IV) / (52w High IV - 52w Low IV) * 100
-        High IV Rank (>70) = expensive premiums, sell strategies
-        Low IV Rank (<30) = cheap premiums, buy strategies
+    def fetch_current_iv(self, symbol: str) -> Optional[float]:
+        """Current implied volatility: median call IV across the nearest 3 expirations.
+
+        Shared by ``fetch_iv_rank`` (52-week positioning) and the options page (seeds the IV-crush
+        estimate and the Greeks calculator). Returns None when no usable chains are available.
         """
         try:
             ticker = yf.Ticker(symbol)
@@ -32,14 +31,12 @@ class OptionsAnalyzer:
             if not options_dates:
                 return None
 
-            # Get IV from nearest-term and some mid-term expirations
             ivs = []
             for exp_date in options_dates[:3]:
                 try:
                     chain = ticker.option_chain(exp_date)
                     calls = chain.calls
                     if not calls.empty:
-                        # Simple IV estimate from call IV values
                         mid_iv = calls["impliedVolatility"].median()
                         if mid_iv > 0:
                             ivs.append(mid_iv)
@@ -48,8 +45,24 @@ class OptionsAnalyzer:
 
             if not ivs:
                 return None
+            mean_iv = float(np.mean(ivs))
+            # Yahoo occasionally returns near-zero IV for a chain (bad/placeholder data); treat
+            # anything below 1% as unavailable rather than reporting a misleading ~0 IV / IV rank.
+            return mean_iv if mean_iv >= 0.01 else None
+        except Exception:
+            return None
 
-            current_iv = np.mean(ivs)
+    def fetch_iv_rank(self, symbol: str) -> Optional[float]:
+        """
+        Calculate IV Rank: where is current IV vs 52-week range?
+        IV Rank = (Current IV - 52w Low IV) / (52w High IV - 52w Low IV) * 100
+        High IV Rank (>70) = expensive premiums, sell strategies
+        Low IV Rank (<30) = cheap premiums, buy strategies
+        """
+        try:
+            current_iv = self.fetch_current_iv(symbol)
+            if current_iv is None:
+                return None
 
             # For 52-week range, we'd need historical volatility
             # As proxy: use historical price volatility

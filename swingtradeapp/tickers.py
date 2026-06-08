@@ -215,6 +215,21 @@ def _yf_screen(predefined: str, count: int):
     return yf.screen(predefined, count=count)
 
 
+def get_raw_screen(predefined: str, count: int = 50) -> list:
+    """Raw quote dicts from one of Yahoo's predefined screeners — no filtering applied.
+
+    Passthrough for the "who's moving" view: returns the screener's quotes exactly as Yahoo
+    sends them (symbol, prices, change %, volume, market cap, pre-market fields, …). Empty list
+    on any failure so callers can render gracefully.
+    """
+    try:
+        result = _yf_screen(predefined, min(count, 250))
+        return result.get("quotes", []) if isinstance(result, dict) else []
+    except Exception:
+        logger.debug("raw screen %s failed", predefined, exc_info=True)
+        return []
+
+
 def get_active_symbols(count: int = 100) -> list:
     """Most-active US equities right now, via Yahoo's predefined screener (live)."""
     try:

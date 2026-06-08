@@ -1,0 +1,8 @@
+# Streamlit theme — intentionally mode-AGNOSTIC.
+# We override only primary accent, font, and corner radius so Streamlit keeps supplying its
+# built-in light AND dark palettes (the app follows the OS / browser setting). Do NOT set
+# `base`, backgroundColor, or textColor here, or you'd pin the app to a single mode.
+[theme]
+primaryColor = "#00c851"   # green accent (buy / positive), consistent with the app palette
+font = "Inter"
+baseRadius = "0.6rem"      # rounded corners app-wide (Streamlit 1.58+)

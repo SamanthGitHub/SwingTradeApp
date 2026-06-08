@@ -11,12 +11,22 @@ import yfinance as yf
 class IPOTracker:
     """Identify and track IPOs for swing trading."""
 
-    # Hardcoded list of recent IPOs (Q4 2024 - Q1 2025)
+    # Curated list of notable recent IPOs (2023-2025). MANUALLY MAINTAINED — refresh periodically
+    # (like the Fed calendar in macro_filters). Kept within ~2y so fetch_ipo_performance's
+    # earliest-close IPO-price proxy stays meaningful.
     RECENT_IPOS = {
-        "SMCI": {"ipo_date": datetime(2024, 1, 12), "name": "Super Micro Computer"},
-        "PLTR": {"ipo_date": datetime(2020, 9, 18), "name": "Palantir Technologies"},
-        "WOLF": {"ipo_date": datetime(2024, 5, 16), "name": "Wolfspeed"},
-        "TSP": {"ipo_date": datetime(2024, 10, 3), "name": "TP"},
+        "ARM":  {"ipo_date": datetime(2023, 9, 14), "name": "Arm Holdings"},
+        "CART": {"ipo_date": datetime(2023, 9, 19), "name": "Instacart (Maplebear)"},
+        "KVYO": {"ipo_date": datetime(2023, 9, 20), "name": "Klaviyo"},
+        "BIRK": {"ipo_date": datetime(2023, 10, 11), "name": "Birkenstock"},
+        "CAVA": {"ipo_date": datetime(2023, 6, 15), "name": "Cava Group"},
+        "RDDT": {"ipo_date": datetime(2024, 3, 21), "name": "Reddit"},
+        "ALAB": {"ipo_date": datetime(2024, 3, 20), "name": "Astera Labs"},
+        "RBRK": {"ipo_date": datetime(2024, 4, 25), "name": "Rubrik"},
+        "TEM":  {"ipo_date": datetime(2024, 6, 14), "name": "Tempus AI"},
+        "LINE": {"ipo_date": datetime(2024, 7, 25), "name": "Lineage"},
+        "CRWV": {"ipo_date": datetime(2025, 3, 28), "name": "CoreWeave"},
+        "CRCL": {"ipo_date": datetime(2025, 6, 5), "name": "Circle Internet Group"},
     }
 
     def is_recent_ipo(self, symbol: str, days_since_ipo: int = 365) -> bool:
