@@ -1,0 +1,11 @@
+# Optional AI models (large, CPU). Enables the Settings → "AI Features" toggles:
+# price forecasting, upgraded sentiment, event tagging, summarization, news novelty.
+# The app runs fine WITHOUT these — each feature falls back to a heuristic.
+#
+# Install into the same venv after the first run:
+#   source ~/.swingtradeapp/venv/bin/activate
+#   pip install -r requirements-ai.txt
+transformers>=4.40
+torch>=2.2
+chronos-forecasting>=1.4
+sentence-transformers>=2.6

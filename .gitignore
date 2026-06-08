@@ -1,0 +1,27 @@
+# Secrets — never commit real credentials
+.env
+.streamlit/secrets.toml
+
+# Local runtime data & caches (regenerated at runtime)
+.data/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor / agent local config
+.claude/
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
