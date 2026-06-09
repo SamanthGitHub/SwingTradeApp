@@ -34,8 +34,9 @@ from swingtradeapp.providers import ProviderFactory
 from swingtradeapp.retry import with_retry
 from swingtradeapp.risk import BayesianKellySizer
 from swingtradeapp.signals import TrendSignalGenerator
-from swingtradeapp.tickers import get_raw_screen, get_screening_universe
+from swingtradeapp.tickers import get_raw_screen, get_screening_universe, get_tradable_universe
 from swingtradeapp import ui
+from swingtradeapp import youtube as yt
 from swingtradeapp.universe import PreMarketScanner, UniverseFilter
 from swingtradeapp.watchlist import WatchlistManager
 from swingtradeapp.whale import WhaleConfig, WhaleDetector
@@ -157,6 +158,75 @@ def fetch_symbol_info(symbol: str) -> Dict:
 def get_screen_universe() -> List[str]:
     """Live listed universe, most-active names first (cached 10 min)."""
     return get_screening_universe()
+
+
+# ── YouTube scanner helpers (all free / key-less; see swingtradeapp/youtube.py) ──
+
+YT_PICKS_PATH = Path(".data/yt_picks.json")
+
+
+@st.cache_data(ttl=86400)
+def get_universe_set() -> set:
+    """Full tradable-symbol set for validating tickers spoken in videos (cached 24h)."""
+    try:
+        return set(get_tradable_universe())
+    except Exception:
+        return set()
+
+
+@st.cache_data(ttl=604800, show_spinner=False)
+def get_yt_channel_id(handle: str) -> Optional[str]:
+    """Resolve an @handle → UC… channel ID (cached a week — IDs never change)."""
+    return yt.resolve_channel_id(handle)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_yt_uploads(channel_id: str, channel_name: str, within_hours: float) -> List[yt.Upload]:
+    """Recent uploads for one channel (cached 30 min)."""
+    return yt.fetch_channel_uploads(channel_id, channel_name, within_hours)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_yt_transcript(video_id: str) -> Optional[List[yt.Segment]]:
+    """Full transcript segments for a video (immutable — cached 24h). None if unavailable."""
+    return yt.fetch_transcript_segments(video_id)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def yt_spy_return_since(from_date: str) -> Optional[float]:
+    """SPY fractional return from ``from_date`` (YYYY-MM-DD) to now — the pick benchmark."""
+    try:
+        hist = fetch_symbol_history("SPY", days=400)
+        if hist.empty:
+            return None
+        closes = hist["Close"]
+        ref = closes[closes.index >= pd.Timestamp(from_date)]
+        if ref.empty:
+            return None
+        start, end = float(ref.iloc[0]), float(closes.iloc[-1])
+        return (end - start) / start if start else None
+    except Exception:
+        return None
+
+
+def yt_current_price(symbol: str) -> Optional[float]:
+    return fetch_symbol_info(symbol).get("price")
+
+
+def load_yt_store() -> Dict:
+    if YT_PICKS_PATH.exists():
+        try:
+            with open(YT_PICKS_PATH) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"picks": []}
+
+
+def save_yt_store(store: Dict) -> None:
+    YT_PICKS_PATH.parent.mkdir(exist_ok=True)
+    with open(YT_PICKS_PATH, "w") as f:
+        json.dump(store, f, indent=2)
 
 
 @st.cache_data(ttl=300)
@@ -333,6 +403,15 @@ def _reco_color(v: str) -> str:
     if isinstance(v, str) and v.startswith("Avoid"):
         return "color:#ff4444"
     return "color:#888888"
+
+
+def _hl_pct(v) -> str:
+    """Green/red text color for a signed numeric percentage (dataframe styler)."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return ""
+    return "color:#00c851" if f > 0 else ("color:#ff4444" if f < 0 else "")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -2434,6 +2513,286 @@ def run_dashboard() -> None:
             st.info("No alerts set.")
 
     # ═══════════════════════ SETTINGS ════════════════════════════════════════
+    elif page == "Information":
+        st.header("ℹ️ Information & Guide")
+        st.caption("How SwingTrade Pro works, what each page is for, when to run it, "
+                   "and the limits of what it can — and can't — tell you.")
+
+        st.warning(
+            "**Not financial advice.** This is a research and screening tool, not a proven "
+            "profitable strategy. It has **no live track record**, and its backtest metrics are "
+            "**survivorship-biased** (the universe is today's listed names). Treat every signal as "
+            "a starting point for your own research — never an instruction to trade."
+        )
+
+        tab_guide, tab_timing, tab_glossary, tab_data, tab_method = st.tabs(
+            ["📄 Page guide", "⏰ When to run", "📖 Glossary", "🗄️ Data & sources", "⚖️ Method & limits"]
+        )
+
+        with tab_guide:
+            st.markdown(
+                "| Page | What it's for |\n"
+                "|---|---|\n"
+                "| **Screener** | The core workflow: scans the universe for trend setups, sizes "
+                "positions (half-Kelly), and drills into any ticker with chart, news & forecast. |\n"
+                "| **Pre-Market Movers** | Biggest gainers/losers right now (pre-market quotes when "
+                "that session is open, else regular session). |\n"
+                "| **Live Movers** | Raw Yahoo predefined-screener feed — no signals, no filters. "
+                "Just who's moving. |\n"
+                "| **After-Hours & IPOs** | Post-market movers (~4–8pm ET) plus a curated recent-IPO "
+                "tracker. |\n"
+                "| **Whale Movements** | Infers large-money footprints from daily volume/$-traded/"
+                "closing-strength → a 0–100 whale score. |\n"
+                "| **Options Flow** | Single-ticker options analysis (IV rank, put/call, unusual "
+                "volume, Greeks) + a small flow scan. |\n"
+                "| **Predictions** | Next-session forecast (Chronos → heuristic fallback) + a "
+                "5-session drill-down cone. |\n"
+                "| **Auto Watchlist** | Auto-built watchlist of the strongest current signals. |\n"
+                "| **ETF Screener** | Screen ETFs by category (sector, broad market, volatility, "
+                "commodities, bonds). |\n"
+                "| **Market Events** | Market-wide news + a mood gauge (news tone + VIX + breadth + "
+                "SPY trend). |\n"
+                "| **Heat Map** | Visual map of moves across the universe. |\n"
+                "| **Watchlists / Compare** | Save names to track; compare several side by side. |\n"
+                "| **P&L Tracker** | Manual trade journal — log signals and track realized P&L. |\n"
+                "| **Alerts** | Threshold alerts on watched names. |\n"
+                "| **Settings** | Cost model, optional local AI toggles, cache/data management. |\n"
+            )
+
+        with tab_timing:
+            st.markdown("#### Best time to run each screen *(all times ET)*")
+            st.markdown(
+                "| Screen | Best window | Why |\n"
+                "|---|---|---|\n"
+                "| **Pre-Market Movers** | **8:00–9:15 AM** | Overnight news, earnings, European "
+                "session and 8:30 econ data are priced in; real volume, gap mostly formed. |\n"
+                "| **Screener** | After 9:45 AM, or evening | Lets the opening gap settle; or scan "
+                "after the close to plan tomorrow. |\n"
+                "| **Live Movers** | Intraday (9:30 AM–4:00 PM) | It's a live session feed. |\n"
+                "| **After-Hours & IPOs** | **4:00–8:00 PM** | Post-market fields are empty outside "
+                "this window. |\n"
+                "| **Predictions / Auto Watchlist** | After the close | Uses completed daily bars; "
+                "stable until the next session. |\n"
+            )
+            st.info(
+                "**On data days, wait until after 8:30 AM.** CPI / jobs / FOMC releases reshuffle "
+                "the movers completely. And always check the **Volume** column — a big % move on "
+                "tiny volume usually fades at the open."
+            )
+
+        with tab_glossary:
+            st.markdown("Every label used across the dashboard:")
+            _render_legend()
+
+        with tab_data:
+            st.markdown(
+                "- **yfinance** — quotes, history, fundamentals, news, predefined screeners.\n"
+                "- **Nasdaq Trader symbol directory** — the tradable universe (cached 24h).\n"
+                "- **Google News RSS** — broad free news (on-demand single-ticker & market views only).\n"
+                "- **Alpaca** — execution (paper/live bracket orders); offline if no keys in `.env`.\n"
+            )
+            st.caption(
+                "All network calls are retry-wrapped (Yahoo 401/429 are usually transient). Data is "
+                "free, delayed/best-effort, and occasionally wrong — corporate actions, thin-volume "
+                "prints and bad ticks happen. Caches refresh on their own TTLs; force a refresh per "
+                "page or via Settings → Clear all caches."
+            )
+
+        with tab_method:
+            st.markdown("""
+**Signals** — Trend + RSI · MACD · Bollinger Bands · ATR-based stops · Volume surge, combined
+into a 0–1 score with an entry / stop / target and a reward-to-risk ratio.
+
+**Risk** — Half-Kelly position sizing with shrinkage, a portfolio heat limit, and a daily
+circuit breaker. Kelly priors are calibrated **once, out-of-sample** on walk-forward trades —
+not on the window being traded.
+
+**Backtest** — Vectorized walk-forward simulation, **net of costs** (slippage + commission,
+editable in Settings). Reports win rate, profit factor and Sharpe.
+
+**Optional AI** — Local, open-source models (price forecasting, news event tagging,
+summarization, novelty), each with a heuristic fallback. Off by default; toggle in Settings.
+            """)
+            st.error(
+                "**Read this before trusting any number.** The backtest is survivorship-biased "
+                "(point-in-time data isn't wired up yet), so its win rate / profit factor are "
+                "optimistic. The signals are standard, widely-arbitraged indicators with no proven "
+                "edge, and there is no forward paper-trading record. The only honest way to know if "
+                "the strategy works is to paper-trade it forward for months and compare to SPY "
+                "buy-and-hold **after costs**."
+            )
+
+        st.markdown("---")
+        st.caption("SwingTrade Pro · for research & education only · you alone are responsible for "
+                   "your trades.")
+
+    elif page == "YouTube":
+        st.header("📺 YouTube — what top traders are saying")
+        st.caption("Scans recent uploads from a curated set of finance YouTubers, reads the full "
+                   "transcript, and surfaces tickers, calls, pullback/merger chatter — and a "
+                   "running track record of who's actually right. Free & key-less.")
+        st.warning("**Opinions, not signals.** Finfluencer picks frequently underperform the "
+                   "market. Treat mentions as leads to research, and watch the track record below "
+                   "before weighting anyone's view.")
+
+        yc1, yc2, yc3 = st.columns([1.2, 2, 1])
+        with yc1:
+            within_hours = st.slider("Lookback (hours)", 12, 48, 48, 6)
+        with yc2:
+            picked = st.multiselect("Channels", list(yt.TRADER_CHANNELS.values()),
+                                    default=list(yt.TRADER_CHANNELS.values()))
+        with yc3:
+            st.write("")
+            if st.button("↻ Refresh", use_container_width=True):
+                fetch_yt_uploads.clear()
+                get_yt_transcript.clear()
+                get_yt_channel_id.clear()
+
+        handle_by_name = {name: handle for handle, name in yt.TRADER_CHANNELS.items()}
+        selected_handles = [(handle_by_name[n], n) for n in picked]
+
+        universe = get_universe_set()
+        analyzer = get_sentiment_analyzer(config)
+        event_clf = get_event_classifier() if _ai_on("ai_events") else None
+        summarizer = get_summarizer() if _ai_on("ai_summary") else None
+
+        # ── Fetch + analyze ──────────────────────────────────────────────────
+        analyses: List[yt.VideoAnalysis] = []
+        skipped_channels: List[str] = []
+        with st.spinner("Resolving channels & fetching recent uploads…"):
+            uploads: List[yt.Upload] = []
+            for handle, name in selected_handles:
+                cid = get_yt_channel_id(handle)
+                if not cid:
+                    skipped_channels.append(name)
+                    continue
+                uploads += fetch_yt_uploads(cid, name, float(within_hours))
+
+        uploads.sort(key=lambda u: u.published_ts, reverse=True)
+        uploads = uploads[:40]  # cap transcript fetches so the scan stays responsive
+
+        if uploads:
+            prog = st.progress(0.0, text="Reading transcripts…")
+            for i, up in enumerate(uploads):
+                segs = get_yt_transcript(up.video_id)
+                analyses.append(yt.analyze_video(
+                    up, segs, universe,
+                    analyzer=analyzer, event_classifier=event_clf, summarizer=summarizer))
+                prog.progress((i + 1) / len(uploads), text=f"Analyzed {i + 1}/{len(uploads)} videos")
+            prog.empty()
+
+        if skipped_channels:
+            st.caption("Couldn't resolve: " + ", ".join(skipped_channels) +
+                       " (handle renamed or rate-limited).")
+
+        if not analyses:
+            st.info("No uploads from the selected channels in the last "
+                    f"{within_hours}h. Widen the lookback or pick more channels.")
+        else:
+            # Persist any new extracted picks (idempotent), then grade the whole history.
+            store = load_yt_store()
+            new_picks = sum(yt.record_picks(store, a, yt_current_price) for a in analyses)
+            if new_picks:
+                save_yt_store(store)
+            graded = yt.grade_picks(store.get("picks", []), yt_current_price, yt_spy_return_since)
+            board = yt.creator_leaderboard(graded)
+
+            transcribed = sum(1 for a in analyses if a.has_transcript)
+            mm1, mm2, mm3, mm4 = st.columns(4)
+            mm1.metric("Videos", len(analyses))
+            mm2.metric("With transcript", f"{transcribed}/{len(analyses)}")
+            mm3.metric("Tickers mentioned", len({t for a in analyses for t in a.tickers}))
+            mm4.metric("Picks tracked", len(store.get("picks", [])))
+
+            # ── Creator track record ─────────────────────────────────────────
+            st.subheader("🏆 Creator track record")
+            st.caption("Graded vs actual price move and SPY over the same window. Builds up as "
+                       "picks accrue — sparse at first.")
+            if board:
+                bdf = pd.DataFrame(board)[["channel", "picks", "graded", "win_rate", "avg_alpha_pct"]]
+                bdf = bdf.rename(columns={"channel": "Creator", "picks": "Picks", "graded": "Graded",
+                                          "win_rate": "Win rate", "avg_alpha_pct": "Avg alpha"})
+                st.dataframe(
+                    bdf.style.format({"Win rate": "{:.2%}", "Avg alpha": "{:+.2f}%"}, na_rep="—")
+                       .map(lambda v: _hl_pct(v), subset=["Avg alpha"]),
+                    use_container_width=True, hide_index=True,
+                )
+            else:
+                st.caption("No graded picks yet — check back after a few scans across some days.")
+
+            # ── Consensus: what they're talking about ────────────────────────
+            st.subheader("🗣️ What they're talking about")
+            consensus = yt.ticker_consensus(analyses)
+            wl_mgr = get_watchlist_manager()
+            for c in consensus[:8]:
+                sym = c["ticker"]
+                rc1, rc2, rc3, rc4, rc5 = st.columns([1, 1.4, 1.4, 1.4, 1.2])
+                rc1.markdown(f"**{sym}**")
+                price = yt_current_price(sym)
+                rc2.markdown(f"${price:.2f}" if price else "—")
+                bull = c["bull_pct"]
+                rc3.markdown(f"{bull:.0%} bull" if bull is not None else "—")
+                rc4.markdown(f"{c['videos']} vids · {c['channels']} ch · conv {c['conviction']:.2f}")
+                if rc5.button("+ Watchlist", key=f"yt_wl_{sym}"):
+                    wl_mgr.add_symbol("YouTube", sym)
+                    st.toast(f"Added {sym} to YouTube watchlist")
+
+            # ── Pullbacks & mergers ──────────────────────────────────────────
+            pc1, pc2 = st.columns(2)
+            with pc1:
+                st.subheader("📉 Pullbacks & impacting statements")
+                hits = [a for a in analyses if a.flags.get("pullback")]
+                if not hits:
+                    st.caption("Nothing flagged.")
+                for a in hits[:6]:
+                    st.markdown(f"**{a.upload.channel}** — [{a.upload.title[:70]}]({a.upload.url})")
+                    for snip in a.flags["pullback"][:2]:
+                        st.caption(snip)
+            with pc2:
+                st.subheader("🤝 Merger news & rumors")
+                hits = [a for a in analyses if a.flags.get("merger") or "M&A" in a.events]
+                if not hits:
+                    st.caption("Nothing flagged.")
+                for a in hits[:6]:
+                    st.markdown(f"**{a.upload.channel}** — [{a.upload.title[:70]}]({a.upload.url})")
+                    for snip in a.flags.get("merger", [])[:2]:
+                        st.caption(snip)
+
+            # ── Extracted calls this scan ────────────────────────────────────
+            st.subheader("🎯 Extracted calls (this scan)")
+            pick_rows = [{
+                "Creator": a.upload.channel, "Ticker": p.ticker,
+                "Dir": (p.direction or "—").upper(), "Target": p.price_target,
+                "Horizon": p.horizon or "—",
+                "At": f"{p.timestamp_sec // 60}:{p.timestamp_sec % 60:02d}",
+            } for a in analyses for p in a.picks]
+            if pick_rows:
+                st.dataframe(pd.DataFrame(pick_rows).style.format({"Target": "${:.2f}"}, na_rep="—"),
+                             use_container_width=True, hide_index=True)
+            else:
+                st.caption("No explicit buy/sell/target calls parsed this scan.")
+
+            # ── Per-video detail ─────────────────────────────────────────────
+            st.subheader("📂 Videos")
+            _sent_emoji = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}
+            for a in analyses:
+                up = a.upload
+                head = f"{_sent_emoji.get(a.sentiment, '⚪')} {up.channel} · {up.title[:80]}"
+                with st.expander(head):
+                    tx = "transcript" if a.has_transcript else "title+description (no transcript)"
+                    st.caption(f"{up.published_str} · {a.sentiment} ({a.sentiment_score:.2f}) · {tx}"
+                               + (f" · events: {', '.join(a.events)}" if a.events else ""))
+                    st.markdown(f"[▶ Open video]({up.url})")
+                    if a.digest:
+                        st.markdown(f"**Digest:** {a.digest}")
+                    if a.mentions:
+                        st.markdown("**Mentions** (jump to the moment):")
+                        for mn in a.mentions[:10]:
+                            ts = f"{mn.timestamp_sec // 60}:{mn.timestamp_sec % 60:02d}"
+                            st.markdown(f"- **{mn.ticker}** [{ts}]({mn.deep_link}) — {mn.snippet[:140]}")
+
+        _render_legend()
+
     elif page == "Settings":
         st.header("Settings")
 

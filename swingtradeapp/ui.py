@@ -31,11 +31,13 @@ NAV_ITEMS: List[Tuple[str, str, str]] = [
     ("Auto Watchlist", "stars", "⭐"),
     ("ETF Screener", "grid-3x3-gap", "🗂️"),
     ("Market Events", "newspaper", "📰"),
+    ("YouTube", "youtube", "📺"),
     ("Heat Map", "fire", "🔥"),
     ("Watchlists", "bookmark-star", "🔖"),
     ("Compare", "bar-chart-line", "📊"),
     ("P&L Tracker", "journal-text", "📒"),
     ("Alerts", "bell", "🔔"),
+    ("Information", "info-circle", "ℹ️"),
     ("Settings", "gear", "⚙️"),
 ]
 
