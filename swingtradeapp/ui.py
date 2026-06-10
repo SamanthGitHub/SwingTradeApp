@@ -54,7 +54,7 @@ NAV_ITEMS: List[Tuple[str, str, str]] = [
 
 _BRAND_CSS = f"""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 
 html, body, [class*="css"], .stMarkdown, button, input, select, textarea {{
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -67,41 +67,106 @@ footer {{visibility: hidden;}}
 [data-testid="stToolbar"] {{display: none;}}
 [data-testid="stHeader"] {{background: transparent;}}
 
-/* Branded gradient header band. */
+@keyframes brandShift {{ 0% {{background-position: 0% 50%;}} 50% {{background-position: 100% 50%;}} 100% {{background-position: 0% 50%;}} }}
+@keyframes livePulse {{ 0%,100% {{opacity: 1; box-shadow: 0 0 0 0 rgba(0,255,106,.55);}} 50% {{opacity: .55; box-shadow: 0 0 0 7px rgba(0,255,106,0);}} }}
+
+/* Branded animated gradient header band with a live status pill. */
 .brand-header {{
-    padding: 1.0rem 1.4rem;
-    border-radius: 0.8rem;
-    margin-bottom: 1.0rem;
-    background: linear-gradient(110deg, {ACCENT_DARK} 0%, #0b7d6f 55%, #0b6cad 100%);
-    box-shadow: 0 4px 18px rgba(0, 0, 0, 0.18);
+    position: relative; overflow: hidden;
+    display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+    padding: 1.15rem 1.5rem; border-radius: 1rem; margin-bottom: 1.15rem;
+    background: linear-gradient(110deg, {ACCENT_DARK} 0%, #0b7d6f 42%, #0b6cad 74%, #5a3fb5 100%);
+    background-size: 240% 240%; animation: brandShift 14s ease infinite;
+    box-shadow: 0 10px 32px rgba(0,168,67,.26), 0 2px 8px rgba(0,0,0,.22);
+}}
+.brand-header::after {{
+    content: ""; position: absolute; inset: 0; pointer-events: none;
+    background: radial-gradient(1100px 220px at 8% -30%, rgba(255,255,255,.20), transparent 60%);
 }}
 .brand-header h1 {{
-    color: #ffffff; font-size: 1.7rem; font-weight: 700; margin: 0; letter-spacing: -0.01em;
+    color: #fff; font-size: 1.8rem; font-weight: 800; margin: 0; letter-spacing: -0.02em;
 }}
 .brand-header p {{
-    color: rgba(255, 255, 255, 0.88); font-size: 0.92rem; font-weight: 500; margin: 0.25rem 0 0 0;
+    color: rgba(255,255,255,.9); font-size: 0.92rem; font-weight: 500; margin: 0.25rem 0 0 0;
+}}
+.brand-live {{
+    display: flex; align-items: center; gap: 0.5rem; flex-shrink: 0;
+    color: #fff; font-weight: 700; font-size: 0.74rem; letter-spacing: 0.12em;
+    background: rgba(255,255,255,.16); padding: 0.42rem 0.85rem; border-radius: 999px;
+    backdrop-filter: blur(6px); border: 1px solid rgba(255,255,255,.22);
+}}
+.brand-live .dot {{
+    width: 9px; height: 9px; border-radius: 50%; background: #00ff6a;
+    animation: livePulse 1.8s ease-in-out infinite;
 }}
 
-/* Metric "cards" — adapt to light/dark via theme CSS variables. */
+/* Metric "cards" — accent bar + hover-lift, adapts to light/dark via theme vars. */
 [data-testid="stMetric"] {{
+    position: relative; overflow: hidden;
     background: var(--secondary-background-color);
-    border: 1px solid rgba(128, 128, 128, 0.18);
-    border-radius: 0.7rem;
-    padding: 0.85rem 1.0rem;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+    border: 1px solid rgba(128,128,128,.16);
+    border-radius: 0.85rem;
+    padding: 0.9rem 1.0rem 0.9rem 1.15rem;
+    box-shadow: 0 1px 3px rgba(0,0,0,.06);
+    transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease;
 }}
-[data-testid="stMetricLabel"] {{opacity: 0.75; font-weight: 600;}}
+[data-testid="stMetric"]::before {{
+    content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 4px;
+    background: linear-gradient(180deg, {ACCENT}, #0b6cad);
+}}
+[data-testid="stMetric"]:hover {{
+    transform: translateY(-3px);
+    box-shadow: 0 10px 24px rgba(0,0,0,.14);
+    border-color: rgba(0,200,81,.5);
+}}
+[data-testid="stMetricValue"] {{ font-weight: 800; font-size: 1.65rem; letter-spacing: -0.02em; }}
+[data-testid="stMetricLabel"] {{
+    opacity: .7; font-weight: 600; text-transform: uppercase;
+    font-size: 0.72rem; letter-spacing: 0.05em;
+}}
 
-/* Tabs + sidebar polish. */
-.stTabs [data-baseweb="tab-list"] button {{font-size: 15px; font-weight: 600;}}
-[data-testid="stSidebar"] {{border-right: 1px solid rgba(128, 128, 128, 0.15);}}
-.metric-positive {{color: {ACCENT}; font-weight: bold;}}
-.metric-negative {{color: #ff4444; font-weight: bold;}}
+/* Pill-style tabs. */
+.stTabs [data-baseweb="tab-list"] {{ gap: 0.45rem; border-bottom: none; }}
+.stTabs [data-baseweb="tab"] {{
+    border-radius: 999px; padding: 0.35rem 0.95rem; font-size: 14px; font-weight: 600;
+    background: var(--secondary-background-color); border: 1px solid rgba(128,128,128,.18);
+}}
+.stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"] {{ display: none; }}
+.stTabs [aria-selected="true"] {{
+    background: linear-gradient(110deg, {ACCENT}, {ACCENT_DARK}) !important;
+    border-color: transparent !important; box-shadow: 0 3px 12px rgba(0,200,81,.35);
+}}
+.stTabs [aria-selected="true"] p {{ color: #fff !important; }}
 
-/* Fallback radio nav (used only when streamlit-option-menu is absent). */
+/* Buttons — rounded, lift + accent glow on hover; gradient for primary. */
+.stButton > button, .stDownloadButton > button {{
+    border-radius: 0.6rem; font-weight: 600; border: 1px solid rgba(128,128,128,.25);
+    transition: transform .12s ease, box-shadow .12s ease, border-color .12s ease;
+}}
+.stButton > button:hover, .stDownloadButton > button:hover {{
+    transform: translateY(-1px); border-color: rgba(0,200,81,.6);
+    box-shadow: 0 5px 16px rgba(0,200,81,.22);
+}}
+.stButton > button[kind="primary"] {{
+    background: linear-gradient(110deg, {ACCENT}, {ACCENT_DARK}); border: none; color: #fff;
+}}
+
+/* Containers: rounded dataframes + expanders. */
+[data-testid="stDataFrame"], [data-testid="stExpander"] {{
+    border-radius: 0.6rem; overflow: hidden; border: 1px solid rgba(128,128,128,.16);
+}}
+
+/* Sidebar polish + subtle accent wash at the top. */
+[data-testid="stSidebar"] {{
+    border-right: 1px solid rgba(128,128,128,.15);
+    background-image: linear-gradient(180deg, rgba(0,200,81,.05), transparent 28%);
+}}
 [data-testid="stSidebar"] .stRadio label {{
     font-size: 0.95rem; padding: 0.15rem 0; font-weight: 500;
 }}
+
+.metric-positive {{color: {ACCENT}; font-weight: bold;}}
+.metric-negative {{color: #ff4444; font-weight: bold;}}
 </style>
 """
 
@@ -115,8 +180,11 @@ def render_header() -> None:
     """Branded gradient title block, replacing the plain ``st.title``/markdown."""
     st.markdown(
         '<div class="brand-header">'
+        '<div>'
         '<h1>📈 SwingTrade Pro</h1>'
         '<p>Multi-factor signals · Backtested edge · Dynamic Kelly sizing · Whale flow</p>'
+        '</div>'
+        '<div class="brand-live"><span class="dot"></span>LIVE</div>'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -161,6 +229,7 @@ def render_nav() -> str:
                     "background-color": ACCENT,
                     "color": "#ffffff",
                     "font-weight": "600",
+                    "box-shadow": "0 3px 14px rgba(0, 200, 81, 0.45)",
                 },
             },
         )

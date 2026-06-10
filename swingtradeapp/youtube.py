@@ -44,6 +44,13 @@ TRADER_CHANNELS: Dict[str, str] = {
     "MinorityMindset": "Minority Mindset",
     "StockMoe": "Stock Moe",
     "FinancialEducation": "Financial Education",
+    "amitinvesting": "Amit Investing",
+    "dumbmoneylive": "Dumb Money Live",
+    "basispointpodcast": "Basis Point Podcast",
+    "funofinvesting": "Fun of Investing",
+    "stevenfiorillo1": "Steven Fiorillo",
+    "thehumblefarmer": "The Humble Farmer",
+    "dr_crossroads": "Dr. Crossroads",
 }
 
 _UA = {"User-Agent": "Mozilla/5.0 (SwingTradeApp YouTube scanner)"}
