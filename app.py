@@ -39,6 +39,7 @@ from swingtradeapp import ui
 from swingtradeapp import youtube as yt
 from swingtradeapp import confluence as cf
 from swingtradeapp import analysis_guide as ag
+from swingtradeapp import insiders as ins
 from swingtradeapp.universe import PreMarketScanner, UniverseFilter
 from swingtradeapp.watchlist import WatchlistManager
 from swingtradeapp.whale import WhaleConfig, WhaleDetector
@@ -323,6 +324,26 @@ def analyze_options(symbol: str) -> Dict:
         "unusual": oa.detect_unusual_volume(symbol),
         "earnings_date": earn,
         "iv_crush": oa.estimate_iv_crush(symbol, current_iv) if current_iv else None,
+    }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_insider(symbol: str) -> Dict:
+    """Real SEC Form-4 insider transactions for a ticker (free via yfinance, cached 1h).
+
+    Returns a tidy transactions frame, the 6-month buy/sell summary, and a net-sentiment dict.
+    """
+    try:
+        t = yf.Ticker(symbol)
+        raw = t.insider_transactions
+        purch = t.insider_purchases
+    except Exception:
+        raw, purch = None, None
+    tidy = ins.tidy_transactions(raw)
+    return {
+        "tidy": tidy,
+        "purchases": purch if isinstance(purch, pd.DataFrame) else pd.DataFrame(),
+        "summary": ins.summarize(tidy),
     }
 
 
@@ -3250,6 +3271,63 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
                         st.success(f"Agreeing screens ({badge}): {r['Why']}")
 
             _render_legend()
+
+    elif page == "Insider Activity":
+        st.header("🕵️ Insider Activity")
+        st.caption("Real SEC **Form 4** filings — corporate insiders (officers, directors, 10%+ "
+                   "owners) buying or selling their own stock. Free via Yahoo/yfinance. Routine "
+                   "selling is normal (comp); **cluster buying** by several insiders is the bullish tell.")
+
+        ic1, ic2 = st.columns([3, 1])
+        with ic1:
+            isym = st.text_input("Ticker", value=st.session_state.get("last_search", "AAPL"),
+                                 key="insider_sym").strip().upper()
+        with ic2:
+            st.write("")
+            go = st.button("Look up", use_container_width=True, type="primary")
+
+        if isym and (go or st.session_state.get("_insider_last") == isym):
+            st.session_state["_insider_last"] = isym
+            with st.spinner(f"Fetching insider filings for {isym}…"):
+                data = fetch_insider(isym)
+            tidy, summ = data["tidy"], data["summary"]
+
+            if tidy.empty:
+                st.info(f"No insider transactions found for {isym} (or the feed is unavailable).")
+            else:
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Net insider (180d)", summ["label"], f"{summ['score']:+d}")
+                m2.metric("Buys", summ["buys"])
+                m3.metric("Sells", summ["sells"])
+                m4.metric("Distinct buyers", summ["cluster_buyers"])
+
+                if summ["cluster_buyers"] >= 2 and summ["score"] > 0:
+                    st.success(f"🟢 **Cluster buy** — {summ['cluster_buyers']} different insiders "
+                               f"bought in the last {summ['window_days']} days.")
+                st.caption(f"Buys ${summ['buy_value']:,.0f} vs sells ${summ['sell_value']:,.0f} · "
+                           f"net ${summ['net_value']:,.0f} over the last {summ['window_days']} days.")
+
+                def _act_color(v):
+                    return ("color:#00c851;font-weight:bold" if v == "Buy"
+                            else ("color:#ff4444;font-weight:bold" if v == "Sell" else "color:#888"))
+
+                disp = tidy.head(50).copy()
+                disp["Date"] = disp["Date"].dt.strftime("%Y-%m-%d")
+                st.dataframe(
+                    disp[["Date", "Insider", "Position", "Action", "Shares", "Value", "Note"]]
+                        .style.format({"Shares": "{:,.0f}", "Value": "${:,.0f}"}, na_rep="—")
+                        .map(_act_color, subset=["Action"]),
+                    use_container_width=True, height=460, hide_index=True,
+                )
+
+                if not data["purchases"].empty:
+                    with st.expander("6-month buy/sell summary (Yahoo)"):
+                        st.dataframe(data["purchases"], use_container_width=True, hide_index=True)
+
+                st.download_button("Download CSV", tidy.to_csv(index=False),
+                                   file_name=f"insider_{isym}.csv", mime="text/csv")
+        else:
+            st.info("Enter a ticker and press **Look up** to see its insider filings.")
 
     elif page == "Settings":
         st.header("Settings")

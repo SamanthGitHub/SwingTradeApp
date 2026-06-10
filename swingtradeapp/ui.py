@@ -37,6 +37,7 @@ NAV_ITEMS: List[Tuple[str, str, str]] = [
     ("Heat Map", "fire", "🔥"),
     # Deeper signals & forecasts
     ("Whale Movements", "water", "🐋"),
+    ("Insider Activity", "person-badge", "🕵️"),
     ("Options Flow", "graph-up-arrow", "🎯"),
     ("Predictions", "magic", "🔮"),
     # News & sentiment research
