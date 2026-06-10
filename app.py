@@ -38,6 +38,7 @@ from swingtradeapp.tickers import get_raw_screen, get_screening_universe, get_tr
 from swingtradeapp import ui
 from swingtradeapp import youtube as yt
 from swingtradeapp import confluence as cf
+from swingtradeapp import analysis_guide as ag
 from swingtradeapp.universe import PreMarketScanner, UniverseFilter
 from swingtradeapp.watchlist import WatchlistManager
 from swingtradeapp.whale import WhaleConfig, WhaleDetector
@@ -440,6 +441,20 @@ def _hl_pct(v) -> str:
     except (TypeError, ValueError):
         return ""
     return "color:#00c851" if f > 0 else ("color:#ff4444" if f < 0 else "")
+
+
+def _limit_note(entry, current) -> str:
+    """Caption clarifying the entry is a pullback *limit* (vs the live price), not a market buy."""
+    try:
+        entry, current = float(entry), float(current)
+    except (TypeError, ValueError):
+        return ""
+    if not entry or not current or abs(entry - current) < 0.005 * current:
+        return ""  # market entry (or ATR fallback) — nothing to clarify
+    pct = abs(entry - current) / current * 100
+    side = "below" if entry < current else "above"
+    return (f"⏳ Entry is a **limit** {pct:.2f}% {side} the live ${current:.2f} — "
+            f"it fills only if price reaches it.")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -975,6 +990,9 @@ def render_ticker_analysis(symbol: str, config, account_size: float,
     c[2].metric("Target", f"${sig.target_price:.2f}",
                 delta=f"+{(sig.target_price - sig.entry_price) / sig.entry_price * 100:.2f}%")
     c[3].metric("R:R", f"{rr:.2f}x")
+    note = _limit_note(sig.entry_price, info.get("price") or closes[-1])
+    if note:
+        st.caption(note)
     m = st.columns(3)
     m[0].metric("RSI", f"{sig.metadata.get('rsi', 0):.2f}")
     m[1].metric("MACD hist", f"{sig.metadata.get('macd_hist', 0):.4f}")
@@ -1602,6 +1620,9 @@ def run_dashboard() -> None:
                 dc1.metric("Entry", f"${row['entry']:.2f}")
                 dc2.metric("Stop", f"${row['stop']:.2f}", delta=f"{(row['stop']-row['entry'])/row['entry']*100:.2f}%")
                 dc3.metric("Target", f"${row['target']:.2f}", delta=f"+{(row['target']-row['entry'])/row['entry']*100:.2f}%")
+                _ln = _limit_note(row.get("entry"), row.get("price"))
+                if _ln:
+                    st.caption(_ln)
                 st.write("**Signal reasons:**", row.get("reasons", ""))
 
                 st.markdown(f"#### 📰 News for {selected}")
@@ -2671,6 +2692,140 @@ def run_dashboard() -> None:
             st.info("No alerts set.")
 
     # ═══════════════════════ SETTINGS ════════════════════════════════════════
+    elif page == "How to Analyze":
+        st.header("🎓 How to Analyze a Stock")
+        st.caption("The method first, then a live worked example. Analysis = combining trend, "
+                   "momentum, volume, risk:reward, fundamentals, sentiment and position sizing into "
+                   "one checklist — no single number tells you everything.")
+
+        # ── Part A: the framework ────────────────────────────────────────────
+        st.subheader("The method — 7 steps")
+        for s in ag.STEPS:
+            with st.expander(s["title"]):
+                st.markdown(f"**What it is:** {s['what']}")
+                st.markdown(f"**Why it matters:** {s['why']}")
+                st.markdown(f"**How to read it:** {s['how']}")
+                st.caption(f"In this app → use the **{s['screen']}** screen.")
+        _render_legend()
+
+        st.markdown("---")
+        # ── Part B: live worked example ──────────────────────────────────────
+        st.subheader("Worked example — grade any ticker")
+        ec1, ec2 = st.columns([3, 1])
+        with ec1:
+            tkr = st.text_input("Ticker", value=st.session_state.get("last_search", "AAPL"),
+                                key="howto_ticker").strip().upper()
+        with ec2:
+            acct = st.number_input("Account size ($)", value=100_000, step=10_000, key="howto_acct")
+
+        def _days_to_earnings(ed):
+            if ed is None:
+                return None
+            try:
+                ts = pd.Timestamp(ed, unit="s") if isinstance(ed, (int, float)) else pd.Timestamp(ed)
+                ts = ts.tz_localize(None) if ts.tzinfo else ts
+                return int((ts.normalize() - pd.Timestamp.now().normalize()).days)
+            except Exception:
+                return None
+
+        if tkr:
+            hist = fetch_symbol_history(tkr, days=160)
+            if hist.empty or len(hist) < 26:
+                st.warning(f"No usable price history for '{tkr}'. Check the symbol.")
+            else:
+                closes = _to_series(hist, "Close")
+                volumes = _to_series(hist, "Volume") if "Volume" in hist.columns else [0] * len(closes)
+                highs = _to_series(hist, "High") if "High" in hist.columns else closes
+                lows = _to_series(hist, "Low") if "Low" in hist.columns else closes
+                opens = _to_series(hist, "Open") if "Open" in hist.columns else closes
+
+                sig = get_signal_generator(config).build_signal(
+                    tkr, closes, volumes, highs=highs, lows=lows, min_score=0.0)
+                info = fetch_symbol_info(tkr)
+                price = info.get("price") or closes[-1]
+                sma20 = float(np.mean(closes[-20:])) if len(closes) >= 20 else None
+                sma50 = float(np.mean(closes[-50:])) if len(closes) >= 50 else None
+                fund = get_fundamentals().get_fundamentals(tkr)
+                sent = aggregate_news_sentiment(tkr, get_sentiment_analyzer(config))
+                pos_pct = sent.get("positive_pct", 0) * 100 if sent.get("count") else None
+                opt = analyze_options(tkr)
+                days_earn = _days_to_earnings(opt.get("earnings_date"))
+                whale = WhaleDetector(WhaleConfig(min_rvol=0.0, min_dollar_vol=0.0)).analyze(
+                    tkr, opens, highs, lows, closes, volumes)
+                whale_sig = whale.get("signal") if whale else None
+
+                rsi = sig.metadata.get("rsi") if sig else None
+                macd_h = sig.metadata.get("macd_hist") if sig else None
+                vol_surge = sig.metadata.get("vol_surge") if sig else None
+                rr = ((sig.target_price - sig.entry_price) / (sig.entry_price - sig.stop_price)
+                      if sig and sig.entry_price > sig.stop_price else None)
+                kelly_frac = None
+                if sig:
+                    kelly_frac = float(get_sizer(config).size_position(sig, account_size=float(acct)).fraction)
+
+                grades = {
+                    "trend": ag.grade_trend(price, sma20, sma50),
+                    "momentum": ag.grade_momentum(rsi, macd_h),
+                    "volume": ag.grade_volume(vol_surge, whale_sig),
+                    "rr": ag.grade_rr(rr),
+                    "fundamentals": ag.grade_fundamentals(
+                        fund.get("pe_ratio"), fund.get("profit_margin"),
+                        fund.get("roe"), fund.get("debt_to_equity")),
+                    "sentiment": ag.grade_sentiment(pos_pct, days_earn),
+                    "risk": ag.grade_risk(kelly_frac),
+                }
+                extras = {
+                    "trend": (f"price ${price:.2f} · SMA20 ${sma20:.2f} · SMA50 ${sma50:.2f}"
+                              if sma20 and sma50 else None),
+                    "rr": ((f"entry ${sig.entry_price:.2f} (limit) · stop ${sig.stop_price:.2f} · "
+                            f"target ${sig.target_price:.2f} · live ${price:.2f}")
+                           if sig and rr else None),
+                    "risk": (f"≈ ${kelly_frac * acct:,.0f} of ${acct:,.0f}" if kelly_frac else None),
+                }
+                step_by_key = {s["key"]: s for s in ag.STEPS}
+
+                reco = recommend_label(sig.score, sig.signal_type) if sig else "—"
+                st.markdown(f"### {tkr} — ${price:,.2f} · {reco}")
+                if sig:
+                    st.plotly_chart(
+                        create_price_chart(tkr, signal_row=pd.Series(
+                            {"entry": sig.entry_price, "stop": sig.stop_price,
+                             "target": sig.target_price})),
+                        use_container_width=True, key=f"howto_price_{tkr}")
+
+                for s in ag.STEPS:
+                    g = grades[s["key"]]
+                    ic, body = st.columns([0.07, 0.93])
+                    ic.markdown(f"<div style='font-size:1.7rem;line-height:1'>{ag.MARKS[g.mark]}</div>",
+                                unsafe_allow_html=True)
+                    line = f"**{s['title']}** — {g.note}"
+                    if extras.get(s["key"]):
+                        line += (f"  \n<span style='color:#888;font-size:0.85em'>"
+                                 f"{extras[s['key']]}</span>")
+                    body.markdown(line, unsafe_allow_html=True)
+                    body.caption(s["how"])
+
+                with st.expander("📰 Headlines (sentiment detail)"):
+                    render_ticker_news(tkr, config)
+                with st.expander("🔮 Model forecast (bonus)"):
+                    render_forecast_panel(tkr, config,
+                                          entry=(sig.entry_price if sig else None),
+                                          stop=(sig.stop_price if sig else None),
+                                          key_prefix="howto")
+
+                n_pass, n_graded, verdict = ag.summarize({k: g.mark for k, g in grades.items()})
+                st.markdown("---")
+                st.subheader(f"📋 Scorecard — {n_pass}/{n_graded} · {verdict}")
+                score_df = pd.DataFrame([
+                    {"Step": step_by_key[k]["title"], "Read": ag.MARKS[grades[k].mark],
+                     "Detail": grades[k].note}
+                    for k in [s["key"] for s in ag.STEPS]
+                ])
+                st.dataframe(score_df, hide_index=True, use_container_width=True)
+                st.caption("Educational framework with rule-of-thumb thresholds — **not financial "
+                           "advice**. A high score is a starting point for your own research, not a "
+                           "signal to buy.")
+
     elif page == "Information":
         st.header("ℹ️ Information & Guide")
         st.caption("How SwingTrade Pro works, what each page is for, when to run it, "

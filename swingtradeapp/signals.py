@@ -8,6 +8,21 @@ from .config import TradingConfig
 
 logger = logging.getLogger(__name__)
 
+# ── Pullback / limit-entry tuning (ATR multiples) ────────────────────────────────
+# Entry is a *limit* placed into a pullback (longs) / bounce (shorts) rather than "buy at market
+# now". The stop is anchored to structure (recent swing) and the target to the expected move from
+# the current price — so a better fill improves the reward:risk instead of it being a fixed 2:1.
+ENTRY_PULLBACK_ATR = 0.5   # default distance of the limit from price when no MA support is nearby
+MIN_PULLBACK_ATR = 0.25    # the limit must sit at least this far into the pullback (a real wait)
+MAX_PULLBACK_ATR = 1.5     # ...but no deeper than this (don't wait for an unlikely fill)
+STOP_BUFFER_ATR = 1.5      # stop sits at least this far beyond entry (a sane swing stop, not noise-tight)
+TARGET_ATR = 3.0           # target distance measured from the *current* price (the move thesis)
+SWING_LOOKBACK = 10        # bars used for the structure (swing low/high) stop
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(x, hi))
+
 
 @dataclass
 class Signal:
@@ -328,23 +343,42 @@ class TrendSignalGenerator:
         if final_score < min_score:
             return None
 
-        # ── Entry / Stop / Target (inverted for shorts) ──────────────────────
-        if signal_type == "long":
-            atr_stop_mult = 2.0
-            atr_target_mult = 4.0
-            stop_price = current_price - atr_stop_mult * atr if atr > 0 else current_price * (1 - self.config.stop_loss_pct)
-            target_price = current_price + atr_target_mult * atr if atr > 0 else current_price * (1 + self.config.take_profit_pct)
-        else:  # short
-            atr_stop_mult = 2.0
-            atr_target_mult = 4.0
-            stop_price = current_price + atr_stop_mult * atr if atr > 0 else current_price * (1 + self.config.stop_loss_pct)
-            target_price = current_price - atr_target_mult * atr if atr > 0 else current_price * (1 - self.config.take_profit_pct)
+        # ── Entry / Stop / Target ────────────────────────────────────────────
+        # Entry is a *limit* into a pullback (long) / bounce (short), not market-now. Stop is
+        # structure-anchored (recent swing) and target is measured from the current price, so a
+        # better fill yields a better R:R instead of a fixed 2:1. Falls back to a market entry when
+        # ATR is unusable so degenerate data still yields a signal.
+        if atr > 0:
+            entry_type = "pullback-limit"
+            if signal_type == "long":
+                support = sma_20 if sma_20 < current_price else current_price - ENTRY_PULLBACK_ATR * atr
+                entry_price = _clamp(support, current_price - MAX_PULLBACK_ATR * atr,
+                                     current_price - MIN_PULLBACK_ATR * atr)
+                recent_low = float(np.min(lo[-SWING_LOOKBACK:]))
+                stop_price = min(entry_price - STOP_BUFFER_ATR * atr, recent_low - 0.1 * atr)
+                target_price = current_price + TARGET_ATR * atr
+            else:  # short — enter on a bounce toward resistance above price
+                resistance = sma_20 if sma_20 > current_price else current_price + ENTRY_PULLBACK_ATR * atr
+                entry_price = _clamp(resistance, current_price + MIN_PULLBACK_ATR * atr,
+                                     current_price + MAX_PULLBACK_ATR * atr)
+                recent_high = float(np.max(h[-SWING_LOOKBACK:]))
+                stop_price = max(entry_price + STOP_BUFFER_ATR * atr, recent_high + 0.1 * atr)
+                target_price = current_price - TARGET_ATR * atr
+        else:  # ATR unavailable → market entry with config-based stop/target
+            entry_type = "market"
+            entry_price = current_price
+            if signal_type == "long":
+                stop_price = current_price * (1 - self.config.stop_loss_pct)
+                target_price = current_price * (1 + self.config.take_profit_pct)
+            else:
+                stop_price = current_price * (1 + self.config.stop_loss_pct)
+                target_price = current_price * (1 - self.config.take_profit_pct)
 
         return Signal(
             ticker=symbol,
             score=final_score,
             signal_type=signal_type,
-            entry_price=current_price,
+            entry_price=round(entry_price, 2),
             stop_price=round(stop_price, 2),
             target_price=round(target_price, 2),
             metadata={
@@ -363,6 +397,7 @@ class TrendSignalGenerator:
                 "sma_20": sma_20,
                 "sma_50": sma_50,
                 "price": current_price,
+                "entry_type": entry_type,
                 "long_score": long_score,
                 "short_score": short_score,
                 "reasons": reasons,

@@ -48,6 +48,7 @@ NAV_ITEMS: List[Tuple[str, str, str]] = [
     ("P&L Tracker", "journal-text", "📒"),
     ("Alerts", "bell", "🔔"),
     # Help & config
+    ("How to Analyze", "mortarboard", "🎓"),
     ("Information", "info-circle", "ℹ️"),
     ("Settings", "gear", "⚙️"),
 ]
