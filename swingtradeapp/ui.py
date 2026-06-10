@@ -181,9 +181,11 @@ footer {{visibility: hidden;}}
     }}
     .brand-header h1 {{ font-size: 1.35rem; }}
     .brand-header p {{ font-size: 0.78rem; }}
-    /* let column rows wrap to 2-up instead of cramming many tiny columns across */
-    [data-testid="stHorizontalBlock"] {{ flex-wrap: wrap; gap: 0.5rem; }}
-    [data-testid="stColumn"], [data-testid="column"] {{
+    /* let column rows wrap to 2-up instead of cramming many tiny columns across.
+       Scoped to the MAIN area so the sidebar / nav is never affected. */
+    [data-testid="stMain"] [data-testid="stHorizontalBlock"] {{ flex-wrap: wrap; gap: 0.5rem; }}
+    [data-testid="stMain"] [data-testid="stColumn"],
+    [data-testid="stMain"] [data-testid="column"] {{
         min-width: 45% !important; flex-basis: 45% !important;
     }}
     /* tighter but still-legible metric cards */

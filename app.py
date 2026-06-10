@@ -457,6 +457,47 @@ def _limit_note(entry, current) -> str:
             f"it fills only if price reaches it.")
 
 
+# ── Scan gating: screens run on a button (not on page open) + a recommended run-time ──────
+# Best ET window to run each scanning screen, so you don't have to run them all every time.
+RECOMMENDED_TIMES: Dict[str, str] = {
+    "Screener": "After 9:45 AM ET (let the open settle) — or after the close to plan tomorrow",
+    "Signal Stack": "After the close, or 9:45 AM+ once the open settles",
+    "ETF Screener": "After the close (daily bars) — or anytime",
+    "Pre-Market Movers": "8:00–9:15 AM ET (after the 8:30 econ data)",
+    "Live Movers": "Intraday, 9:30 AM–4:00 PM ET",
+    "After-Hours & IPOs": "4:00–8:00 PM ET (post-market session)",
+    "Whale Movements": "After the close (uses completed daily bars)",
+    "Options Flow": "Midday ~10:00 AM–3:30 PM ET (chains most liquid)",
+    "Predictions": "After the close (next-session forecast)",
+    "Auto Watchlist": "8:00–9:15 AM ET (pre-market movers) or just after the open",
+    "Market Events": "Pre-open ~8:00 AM ET, or midday for a fresh read",
+    "Heat Map": "Intraday or after the close",
+    "YouTube": "Evening / after the close (creators post post-market)",
+}
+
+
+def scan_gate(key: str, recommended: str, clear=None) -> bool:
+    """Gate a heavy scan behind a button. Shows the recommended run-time + a Scan/Re-scan button
+    and returns whether to run. The screen does NOT scan on page open — only on click — and the
+    gate is reset on navigation (see run_dashboard) so each visit asks again.
+    """
+    st.caption(f"🕒 **Best time to run:** {recommended}")
+    flag = f"_scan_{key}"
+    if st.session_state.get(flag):
+        if st.button("↻ Re-scan (fresh data)", key=f"rescan_{key}"):
+            if clear is not None:
+                try:
+                    clear()
+                except Exception:
+                    pass
+        return True
+    if st.button("▶ Scan now", key=f"scanbtn_{key}", type="primary"):
+        st.session_state[flag] = True
+        return True
+    st.info("This screen doesn't run automatically — press **▶ Scan now** when you're ready.")
+    return False
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def build_auto_watchlist(_config, top_n: int = 20, min_change_pct: float = 2.0,
                          with_forecast: bool = False) -> pd.DataFrame:
@@ -1464,7 +1505,7 @@ def run_dashboard() -> None:
         page_title="SwingTrade Pro Dashboard",
         page_icon="📈",
         layout="wide",
-        initial_sidebar_state="auto",  # auto-collapses the nav on phones for more screen
+        initial_sidebar_state="expanded",  # keep the nav open; users collapse it via the hamburger
     )
 
     ui.inject_theme()
@@ -1487,6 +1528,13 @@ def run_dashboard() -> None:
     watchlist_mgr = get_watchlist_manager()
 
     page = ui.render_nav()
+
+    # Reset scan gates whenever the page changes, so each screen waits for an explicit
+    # ▶ Scan now on every visit instead of auto-running.
+    if st.session_state.get("_active_page") != page:
+        for _k in [k for k in list(st.session_state) if k.startswith("_scan_")]:
+            del st.session_state[_k]
+        st.session_state["_active_page"] = page
 
     with st.sidebar:
         st.divider()
@@ -1544,8 +1592,9 @@ def run_dashboard() -> None:
                 "sectors": sectors if sectors else None,
             }
 
-        if st.button("Refresh Scan", use_container_width=False):
-            st.cache_data.clear()
+        if not scan_gate("screener", RECOMMENDED_TIMES["Screener"],
+                         clear=lambda: (get_screen_universe.clear(), calibrate_kelly_priors.clear())):
+            st.stop()
 
         tickers = get_screen_universe()
         scan_universe = tickers[:sample_size]
@@ -1669,16 +1718,14 @@ def run_dashboard() -> None:
         st.caption("Biggest gainers and losers right now (pre-market quotes when the pre-market "
                    "session is open, otherwise the regular session). Live from Yahoo Finance.")
 
-        mc1, mc2, mc3 = st.columns(3)
+        mc1, mc2 = st.columns(2)
         with mc1:
             mv_n = st.slider("Show top", 10, 50, 25, 5)
         with mc2:
             mv_min = st.slider("Min move %", 0.0, 10.0, 1.0, 0.5)
-        with mc3:
-            st.write("")
-            if st.button("↻ Refresh now"):
-                fetch_movers.clear()
 
+        if not scan_gate("premarket", RECOMMENDED_TIMES["Pre-Market Movers"], clear=fetch_movers.clear):
+            st.stop()
         with st.spinner("Fetching movers…"):
             mv = fetch_movers(top_n=mv_n, min_change_pct=mv_min)
 
@@ -1735,16 +1782,14 @@ def run_dashboard() -> None:
         st.caption("Raw Yahoo Finance screener feed — no filters, no signals, no recommendations. "
                    "Just who's moving right now. Pick a screener and look.")
 
-        lc1, lc2, lc3 = st.columns([2, 1, 1])
+        lc1, lc2 = st.columns([2, 1])
         with lc1:
             screen_name = st.selectbox("Screener", list(RAW_SCREENS.keys()))
         with lc2:
             lm_count = st.slider("How many", 10, 100, 50, 10)
-        with lc3:
-            st.write("")
-            if st.button("↻ Refresh now"):
-                fetch_raw_movers.clear()
 
+        if not scan_gate("livemovers", RECOMMENDED_TIMES["Live Movers"], clear=fetch_raw_movers.clear):
+            st.stop()
         with st.spinner(f"Fetching {screen_name}…"):
             raw = fetch_raw_movers(RAW_SCREENS[screen_name], count=lm_count)
 
@@ -1773,16 +1818,15 @@ def run_dashboard() -> None:
                    "and a tracker for notable recent IPOs.")
 
         st.subheader("After-Hours Movers")
-        ah1, ah2, ah3 = st.columns(3)
+        ah1, ah2 = st.columns(2)
         with ah1:
             ah_n = st.slider("Show top", 10, 50, 25, 5, key="ah_n")
         with ah2:
             ah_min = st.slider("Min move %", 0.0, 10.0, 1.0, 0.5, key="ah_min")
-        with ah3:
-            st.write("")
-            if st.button("↻ Refresh now", key="ah_refresh"):
-                fetch_afterhours.clear()
 
+        if not scan_gate("afterhours", RECOMMENDED_TIMES["After-Hours & IPOs"],
+                         clear=lambda: (fetch_afterhours.clear(), ipo_table.clear())):
+            st.stop()
         with st.spinner("Fetching after-hours movers…"):
             ah = fetch_afterhours(top_n=ah_n, min_change_pct=ah_min)
 
@@ -1881,7 +1925,7 @@ def run_dashboard() -> None:
                    "changing hands and where the day closed in its range. No dark-pool / Level 2 "
                    "data — this is smart-money *inference* from free Yahoo Finance OHLCV.")
 
-        wc1, wc2, wc3, wc4 = st.columns(4)
+        wc1, wc2, wc3 = st.columns(3)
         with wc1:
             w_n = st.slider("Universe size", 40, 250, 120, 20,
                             help="Most-active names are scanned first")
@@ -1891,11 +1935,9 @@ def run_dashboard() -> None:
         with wc3:
             w_dollar = st.slider("Min $ traded ($M)", 10, 500, 50, 10,
                                  help="Minimum dollar volume to count as whale size")
-        with wc4:
-            st.write("")
-            if st.button("↻ Refresh now"):
-                scan_whale_activity.clear()
 
+        if not scan_gate("whale", RECOMMENDED_TIMES["Whale Movements"], clear=scan_whale_activity.clear):
+            st.stop()
         with st.spinner("Scanning the tape for whale activity…"):
             whales = scan_whale_activity(sample_size=w_n, min_rvol=w_rvol,
                                          min_dollar_vol_m=float(w_dollar))
@@ -2084,14 +2126,10 @@ def run_dashboard() -> None:
         st.subheader("Unusual flow scan")
         st.caption("Scans the most-active names for options sentiment + unusual volume. **Slow** — "
                    "each symbol pulls a live option chain — so it's a small sample, cached 20 min.")
-        sf1, sf2 = st.columns([1, 1])
-        with sf1:
-            sf_n = st.slider("Symbols to scan", 5, 30, 15, 5)
-        with sf2:
-            st.write("")
-            if st.button("↻ Rescan", key="of_refresh"):
-                scan_options_flow.clear()
+        sf_n = st.slider("Symbols to scan", 5, 30, 15, 5)
 
+        if not scan_gate("optionsflow", RECOMMENDED_TIMES["Options Flow"], clear=scan_options_flow.clear):
+            st.stop()
         with st.spinner("Scanning live option chains…"):
             flow = scan_options_flow(sample_size=sf_n)
 
@@ -2119,17 +2157,15 @@ def run_dashboard() -> None:
                    "random-walk from recent returns. Shows the median predicted close, the "
                    "p10–p90 range, and the implied next-day return. **Model output, not advice.**")
 
-        pc1, pc2, pc3 = st.columns([1, 1, 1])
+        pc1, pc2 = st.columns(2)
         with pc1:
             pr_n = st.slider("Universe size", 20, 150, 60, 10,
                              help="Most-active names are scanned first")
         with pc2:
             pr_dir = st.selectbox("Show", ["All", "Bullish only", "Bearish only"])
-        with pc3:
-            st.write("")
-            if st.button("↻ Refresh now"):
-                predict_tomorrow.clear()
 
+        if not scan_gate("predictions", RECOMMENDED_TIMES["Predictions"], clear=predict_tomorrow.clear):
+            st.stop()
         with st.spinner("Forecasting tomorrow's moves…"):
             preds = predict_tomorrow(sample_size=pr_n)
 
@@ -2233,6 +2269,9 @@ def run_dashboard() -> None:
                                     help="Overwrites the 'Pre-Market Bulls' watchlist on each run")
 
         use_fc = _ai_on("ai_forecast")
+        if not scan_gate("autowatchlist", RECOMMENDED_TIMES["Auto Watchlist"],
+                         clear=build_auto_watchlist.clear):
+            st.stop()
         with st.spinner("Scanning bullish movers and building signals…"):
             awl = build_auto_watchlist(config, top_n=aw_n, min_change_pct=aw_min,
                                        with_forecast=use_fc)
@@ -2291,6 +2330,8 @@ def run_dashboard() -> None:
             st.info("Pick at least one category to scan.")
             st.stop()
 
+        if not scan_gate("etf", RECOMMENDED_TIMES["ETF Screener"], clear=fetch_etf_table.clear):
+            st.stop()
         total = sum(len(ETF_CATEGORIES[c]) for c in sel_cats)
         with st.spinner(f"Loading signals for {total} ETFs across {len(sel_cats)} categories…"):
             etf_df = fetch_etf_table(config, tuple(sel_cats))
@@ -2338,6 +2379,10 @@ def run_dashboard() -> None:
                    "most likely to move stocks.")
 
         macro = get_macro_context()
+
+        if not scan_gate("marketevents", RECOMMENDED_TIMES["Market Events"],
+                         clear=lambda: (compute_market_mood.clear(), scan_market_events.clear())):
+            st.stop()
 
         # ── Market Mood (news tone + VIX + breadth + trend) ──────────────────
         st.subheader("Market Mood")
@@ -2428,6 +2473,8 @@ def run_dashboard() -> None:
         st.caption("Tiles sized by market cap, colored by today's % change — green up, red down. Grouped by sector.")
         hm_size = st.slider("Universe size", 30, 300, 120, 10)
 
+        if not scan_gate("heatmap", RECOMMENDED_TIMES["Heat Map"], clear=fetch_heatmap_data.clear):
+            st.stop()
         tickers = get_screen_universe()[:hm_size]
         with st.spinner("Loading market data…"):
             hm_df = fetch_heatmap_data(tickers)
@@ -2957,21 +3004,20 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
                    "market. Treat mentions as leads to research, and watch the track record below "
                    "before weighting anyone's view.")
 
-        yc1, yc2, yc3 = st.columns([1.2, 2, 1])
+        yc1, yc2 = st.columns([1, 2])
         with yc1:
             within_hours = st.slider("Lookback (hours)", 12, 48, 48, 6)
         with yc2:
             picked = st.multiselect("Channels", list(yt.TRADER_CHANNELS.values()),
                                     default=list(yt.TRADER_CHANNELS.values()))
-        with yc3:
-            st.write("")
-            if st.button("↻ Refresh", use_container_width=True):
-                fetch_yt_uploads.clear()
-                get_yt_transcript.clear()
-                get_yt_channel_id.clear()
 
         handle_by_name = {name: handle for handle, name in yt.TRADER_CHANNELS.items()}
         selected_handles = [(handle_by_name[n], n) for n in picked]
+
+        if not scan_gate("youtube", RECOMMENDED_TIMES["YouTube"],
+                         clear=lambda: (fetch_yt_uploads.clear(), get_yt_transcript.clear(),
+                                        get_yt_channel_id.clear())):
+            st.stop()
 
         universe = get_universe_set()
         analyzer = get_sentiment_analyzer(config)
@@ -3134,9 +3180,8 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
         with sc4:
             min_agree = st.slider("Min signals agreeing", 1, 7, 2, 1)
 
-        if st.button("↻ Refresh"):
-            build_signal_stack.clear()
-
+        if not scan_gate("signalstack", RECOMMENDED_TIMES["Signal Stack"], clear=build_signal_stack.clear):
+            st.stop()
         with st.spinner(f"Stacking signals across {n} names (joins several scans)…"):
             stack = build_signal_stack(config, n)
 
