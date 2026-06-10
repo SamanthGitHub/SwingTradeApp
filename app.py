@@ -37,6 +37,7 @@ from swingtradeapp.signals import TrendSignalGenerator
 from swingtradeapp.tickers import get_raw_screen, get_screening_universe, get_tradable_universe
 from swingtradeapp import ui
 from swingtradeapp import youtube as yt
+from swingtradeapp import confluence as cf
 from swingtradeapp.universe import PreMarketScanner, UniverseFilter
 from swingtradeapp.watchlist import WatchlistManager
 from swingtradeapp.whale import WhaleConfig, WhaleDetector
@@ -211,6 +212,33 @@ def yt_spy_return_since(from_date: str) -> Optional[float]:
 
 def yt_current_price(symbol: str) -> Optional[float]:
     return fetch_symbol_info(symbol).get("price")
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def yt_price_on(symbol: str, date_str: str) -> Optional[float]:
+    """Close on (or the last trading day before) ``date_str`` — entry price for a dated call."""
+    try:
+        hist = fetch_symbol_history(symbol, days=400)
+        if hist.empty or "Close" not in hist.columns:
+            return None
+        closes = hist["Close"]
+        upto = closes[closes.index <= pd.Timestamp(date_str) + pd.Timedelta(days=1)]
+        return float(upto.iloc[-1]) if not upto.empty else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def yt_peak_since(symbol: str, date_str: str) -> Optional[float]:
+    """Highest High since ``date_str`` — used to check whether a price target was reached."""
+    try:
+        hist = fetch_symbol_history(symbol, days=400)
+        if hist.empty or "High" not in hist.columns:
+            return None
+        highs = hist["High"][hist.index >= pd.Timestamp(date_str)]
+        return float(highs.max()) if not highs.empty else None
+    except Exception:
+        return None
 
 
 def load_yt_store() -> Dict:
@@ -544,20 +572,26 @@ def scan_whale_activity(sample_size: int = 120, min_rvol: float = 2.0,
 
 # ETF categories sourced from ETFScreener (single source of truth).
 ETF_CATEGORIES = {
-    "Sector": ETFScreener.SECTOR_ETFS,
     "Broad Market": ETFScreener.BROAD_MARKET_ETFS,
-    "Volatility": ETFScreener.VOLATILITY_ETFS,
+    "Sector": ETFScreener.SECTOR_ETFS,
+    "Dividend & Factor": ETFScreener.DIVIDEND_FACTOR_ETFS,
+    "Thematic": ETFScreener.THEMATIC_ETFS,
+    "International": ETFScreener.INTERNATIONAL_ETFS,
     "Commodities": ETFScreener.COMMODITY_ETFS,
     "Bonds": ETFScreener.BOND_ETFS,
+    "Volatility": ETFScreener.VOLATILITY_ETFS,
+    "Crypto": ETFScreener.CRYPTO_ETFS,
+    "Leveraged / Inverse": ETFScreener.LEVERAGED_ETFS,
 }
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_etf_table(_config) -> pd.DataFrame:
-    """Signals + daily change for every tracked ETF, tagged by category."""
+def fetch_etf_table(_config, categories: tuple) -> pd.DataFrame:
+    """Signals + daily change for the selected ETF categories (cached per selection)."""
     gen = get_signal_generator(_config)
     rows = []
-    for category, mapping in ETF_CATEGORIES.items():
+    for category in categories:
+        mapping = ETF_CATEGORIES.get(category, {})
         for sym, name in mapping.items():
             hist = fetch_symbol_history(sym, days=160)
             if hist.empty:
@@ -1157,6 +1191,114 @@ def build_signal_table(
                     "rsi", "macd_hist", "vol_surge", "sentiment_pct", "risk_reward"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+# ── Signal Stack: cross-screen conviction board ─────────────────────────────────
+
+# Canonical GICS sector → SPDR sector ETF (covers yfinance's sector-name variants).
+SECTOR_TO_ETF = {
+    "Technology": "XLK", "Information Technology": "XLK",
+    "Health Care": "XLV", "Healthcare": "XLV",
+    "Financials": "XLF", "Financial Services": "XLF",
+    "Energy": "XLE",
+    "Consumer Discretionary": "XLY", "Consumer Cyclical": "XLY",
+    "Consumer Staples": "XLP", "Consumer Defensive": "XLP",
+    "Industrials": "XLI",
+    "Real Estate": "XLRE",
+    "Utilities": "XLU",
+    "Materials": "XLB", "Basic Materials": "XLB",
+    "Communication Services": "XLC",
+}
+
+
+def yt_social_map() -> Dict[str, tuple]:
+    """Per-ticker (bull_pct, mentions) from the persisted YouTube picks store — no network."""
+    tally: Dict[str, list] = {}
+    for p in load_yt_store().get("picks", []):
+        sym = p.get("ticker")
+        if not sym:
+            continue
+        d = tally.setdefault(sym, [0, 0, 0])  # [buy, sell, total]
+        d[2] += 1
+        if p.get("direction") == "buy":
+            d[0] += 1
+        elif p.get("direction") == "sell":
+            d[1] += 1
+    out: Dict[str, tuple] = {}
+    for sym, (buy, sell, total) in tally.items():
+        decided = buy + sell
+        out[sym] = ((buy / decided) if decided else None, total)
+    return out
+
+
+def _vote_arrow(v) -> str:
+    if v is None:
+        return ""
+    return "▲" if v.dir > 0 else ("▼" if v.dir < 0 else "·")
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def build_signal_stack(_config, n: int = 80) -> pd.DataFrame:
+    """Join the cached scan outputs by symbol and score each name by signal confluence.
+
+    The base technical scan (every active name, no score gate) is the only real cost; whale,
+    forecast, options, social and sector reads are folded in from cached/persisted sources.
+    """
+    base = build_signal_table(get_screen_universe()[:n], _config, threshold=0.0,
+                              allocation_scale=1.0, account_size=100000.0,
+                              filters={}, include_backtest=False)
+    if base.empty:
+        return pd.DataFrame()
+
+    whale = scan_whale_activity(sample_size=n)
+    whale_map = {r["symbol"]: r for _, r in whale.iterrows()} if not whale.empty else {}
+    fc = predict_tomorrow(sample_size=n)
+    fc_map = {r["Symbol"]: r for _, r in fc.iterrows()} if not fc.empty else {}
+    opt = scan_options_flow(sample_size=min(n, 25))
+    opt_map = {r["Symbol"]: r for _, r in opt.iterrows()} if not opt.empty else {}
+    social = yt_social_map()
+    sect_etf = fetch_etf_table(_config, ("Sector",))
+    etf_change = ({r["Symbol"]: r["Change %"] for _, r in sect_etf.iterrows()}
+                  if not sect_etf.empty else {})
+
+    rows: List[Dict] = []
+    for _, b in base.iterrows():
+        sym = b["symbol"]
+        w, f, o = whale_map.get(sym), fc_map.get(sym), opt_map.get(sym)
+        soc_bull, soc_mentions = social.get(sym, (None, 0))
+        sector_name = b.get("sector")
+        sect_chg = etf_change.get(SECTOR_TO_ETF.get(sector_name)) if sector_name else None
+
+        votes = {
+            "tech": cf.vote_tech(b.get("recommendation"), b.get("score")),
+            "whale": cf.vote_whale(w["signal"], w["whale_score"]) if w is not None else None,
+            "forecast": cf.vote_forecast(f["Direction"], f["Pred Return %"]) if f is not None else None,
+            "options": cf.vote_options(o["Sentiment"], o["# Unusual"]) if o is not None else None,
+            "news": cf.vote_news(b.get("sentiment_pct")),
+            "social": cf.vote_social(soc_bull, soc_mentions),
+            "sector": cf.vote_sector(sect_chg),
+        }
+        res = cf.score_ticker(votes)
+        sign = 1 if res["direction"] == "long" else (-1 if res["direction"] == "short" else 0)
+        why = [k.title() for k in cf.SIGNAL_ORDER
+               if votes.get(k) and sign and votes[k].dir == sign]
+
+        row = {
+            "Symbol": sym, "Price": b.get("price"),
+            "Direction": res["direction"], "Conviction": res["conviction"],
+            "Confluence": res["confluence"], "Coverage": res["coverage"],
+            "_agree": res["agree_n"], "_net": res["net"],
+            "Why": ", ".join(why), "Sector name": sector_name,
+        }
+        for k in cf.SIGNAL_ORDER:
+            row[k.title()] = _vote_arrow(votes[k])
+            row[f"_d_{k}"] = votes[k].detail if votes[k] else ""
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(["Conviction", "_agree"], ascending=False).reset_index(drop=True)
     return df
 
 
@@ -2101,11 +2243,27 @@ def run_dashboard() -> None:
     # ═══════════════════════ ETF SCREENER ════════════════════════════════════
     elif page == "ETF Screener":
         st.header("ETF Screener — by Category")
-        st.caption("Sector, broad-market, volatility, commodity and bond ETFs with daily "
-                   "change and trend signal — all on one screen.")
+        st.caption("Famous ETFs across sectors, themes, factors, regions, commodities, bonds, "
+                   "crypto and more — each with daily change and a trend signal. Pick categories "
+                   "below; loading everything cold takes a moment, then it's cached.")
 
-        with st.spinner("Loading ETF signals…"):
-            etf_df = fetch_etf_table(config)
+        all_cats = list(ETF_CATEGORIES)
+        default_cats = ["Broad Market", "Sector", "Thematic"]
+        ec1, ec2 = st.columns([4, 1])
+        with ec1:
+            sel_cats = st.multiselect("Categories", all_cats, default=default_cats,
+                                      help="Each ETF is fetched individually, so more categories = slower first load.")
+        with ec2:
+            st.write("")
+            if st.button("Select all", use_container_width=True):
+                sel_cats = all_cats
+        if not sel_cats:
+            st.info("Pick at least one category to scan.")
+            st.stop()
+
+        total = sum(len(ETF_CATEGORIES[c]) for c in sel_cats)
+        with st.spinner(f"Loading signals for {total} ETFs across {len(sel_cats)} categories…"):
+            etf_df = fetch_etf_table(config, tuple(sel_cats))
 
         if etf_df.empty:
             st.warning("No ETF data available right now.")
@@ -2127,7 +2285,7 @@ def run_dashboard() -> None:
                 return ("color:#00c851" if v == "long"
                         else ("color:#ff4444" if v == "short" else ""))
 
-            for category in ETF_CATEGORIES:
+            for category in sel_cats:
                 cat_df = etf_df[etf_df["Category"] == category]
                 if cat_df.empty:
                     continue
@@ -2691,10 +2849,11 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
         else:
             # Persist any new extracted picks (idempotent), then grade the whole history.
             store = load_yt_store()
-            new_picks = sum(yt.record_picks(store, a, yt_current_price) for a in analyses)
+            new_picks = sum(yt.record_picks(store, a, yt_price_on) for a in analyses)
             if new_picks:
                 save_yt_store(store)
-            graded = yt.grade_picks(store.get("picks", []), yt_current_price, yt_spy_return_since)
+            graded = yt.grade_picks(store.get("picks", []), yt_current_price,
+                                    yt_spy_return_since, yt_peak_since)
             board = yt.creator_leaderboard(graded)
 
             transcribed = sum(1 for a in analyses if a.has_transcript)
@@ -2792,6 +2951,94 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
                             st.markdown(f"- **{mn.ticker}** [{ts}]({mn.deep_link}) — {mn.snippet[:140]}")
 
         _render_legend()
+
+    elif page == "Signal Stack":
+        st.header("🧩 Signal Stack — cross-screen conviction")
+        st.caption("Where the screens agree. Each name is scored by how many independent signals — "
+                   "technical · whale flow · forecast · options · news · YouTube · sector — line up, "
+                   "long or short. Built by joining the other screens' (mostly cached) outputs.")
+        st.caption("⚠️ The signals aren't fully independent (technicals & forecast both use price; "
+                   "news & social are both sentiment), so confluence is suggestive, not proof.")
+
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        with sc1:
+            n = st.slider("Universe size", 40, 150, 80, 10)
+        with sc2:
+            dir_filter = st.selectbox("Direction", ["All", "Long", "Short"])
+        with sc3:
+            min_conv = st.slider("Min conviction", 0, 100, 20, 5)
+        with sc4:
+            min_agree = st.slider("Min signals agreeing", 1, 7, 2, 1)
+
+        if st.button("↻ Refresh"):
+            build_signal_stack.clear()
+
+        with st.spinner(f"Stacking signals across {n} names (joins several scans)…"):
+            stack = build_signal_stack(config, n)
+
+        if stack.empty:
+            st.warning("No signals to stack right now — try a larger universe or refresh.")
+        else:
+            view = stack.copy()
+            if dir_filter == "Long":
+                view = view[view["Direction"] == "long"]
+            elif dir_filter == "Short":
+                view = view[view["Direction"] == "short"]
+            view = view[(view["Conviction"] >= min_conv) & (view["_agree"] >= min_agree)]
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Names", len(view))
+            m2.metric("Long", int((view["Direction"] == "long").sum()))
+            m3.metric("Short", int((view["Direction"] == "short").sum()))
+            m4.metric("Avg conviction", f"{view['Conviction'].mean():.0f}" if not view.empty else "—")
+
+            if view.empty:
+                st.info("Nothing clears those filters — lower the minimums.")
+            else:
+                sig_cols = [k.title() for k in cf.SIGNAL_ORDER]
+                disp_cols = (["Symbol", "Price", "Direction", "Conviction", "Confluence", "Coverage"]
+                             + sig_cols + ["Why"])
+
+                def _dir_color(v):
+                    return ("color:#00c851;font-weight:bold" if v == "long"
+                            else ("color:#ff4444;font-weight:bold" if v == "short" else "color:#888"))
+
+                def _arrow_color(v):
+                    return ("color:#00c851" if v == "▲" else ("color:#ff4444" if v == "▼" else "color:#888"))
+
+                st.dataframe(
+                    view[disp_cols].style.format({"Price": "${:.2f}", "Conviction": "{:.0f}"}, na_rep="—")
+                        .map(_dir_color, subset=["Direction"])
+                        .map(_arrow_color, subset=sig_cols),
+                    use_container_width=True, height=460, hide_index=True,
+                )
+                st.caption("**Conviction** = signal strength × breadth · **Coverage** = how many of "
+                           "7 signals had a read · **Confluence** = how many of those agree. "
+                           "▲ bullish · ▼ bearish · · neutral · blank = no read.")
+
+                st.download_button("Download CSV", view[disp_cols].to_csv(index=False),
+                                   file_name=f"signal_stack_{datetime.now():%Y%m%d_%H%M}.csv",
+                                   mime="text/csv")
+
+                # ── Drill-down ───────────────────────────────────────────────
+                st.markdown("---")
+                pick = st.selectbox("Inspect ticker", view["Symbol"].tolist())
+                if pick:
+                    r = view[view["Symbol"] == pick].iloc[0]
+                    badge = r["Direction"].upper()
+                    st.markdown(f"### {pick} — **{badge}** · conviction {r['Conviction']} · "
+                                f"confluence {r['Confluence']}")
+                    st.plotly_chart(create_price_chart(pick), use_container_width=True,
+                                    key=f"stack_price_{pick}")
+                    st.markdown("**Per-signal read:**")
+                    for k in cf.SIGNAL_ORDER:
+                        arrow = r[k.title()]
+                        det = r.get(f"_d_{k}", "")
+                        st.markdown(f"- **{k.title()}** {arrow or '—'} · {det or '_no read_'}")
+                    if r["Why"]:
+                        st.success(f"Agreeing screens ({badge}): {r['Why']}")
+
+            _render_legend()
 
     elif page == "Settings":
         st.header("Settings")

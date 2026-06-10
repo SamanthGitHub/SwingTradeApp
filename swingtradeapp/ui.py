@@ -20,23 +20,34 @@ ACCENT_DARK = "#00a843"
 
 # (page label, Bootstrap icon name, emoji fallback). The LABEL must stay byte-identical to the
 # `if page == "..."` branches in app.py — it is the routing key.
+# Ordered as a trader's workflow: find ideas → see what's moving → dig into signals →
+# research the story → track your own positions → help & config. Labels MUST stay
+# byte-identical to the `page == "…"` branches in app.py (they're the routing keys);
+# only the order changes here.
 NAV_ITEMS: List[Tuple[str, str, str]] = [
+    # Find ideas
     ("Screener", "graph-up", "📈"),
+    ("Signal Stack", "layers", "🧩"),  # synthesis of the other screens
+    ("ETF Screener", "grid-3x3-gap", "🗂️"),
+    ("Auto Watchlist", "stars", "⭐"),
+    # What's moving now (by session) + market overview
     ("Pre-Market Movers", "sunrise", "🌅"),
     ("Live Movers", "lightning-charge", "⚡"),
     ("After-Hours & IPOs", "moon-stars", "🌙"),
+    ("Heat Map", "fire", "🔥"),
+    # Deeper signals & forecasts
     ("Whale Movements", "water", "🐋"),
     ("Options Flow", "graph-up-arrow", "🎯"),
     ("Predictions", "magic", "🔮"),
-    ("Auto Watchlist", "stars", "⭐"),
-    ("ETF Screener", "grid-3x3-gap", "🗂️"),
+    # News & sentiment research
     ("Market Events", "newspaper", "📰"),
     ("YouTube", "youtube", "📺"),
-    ("Heat Map", "fire", "🔥"),
+    # Track & manage my positions
     ("Watchlists", "bookmark-star", "🔖"),
     ("Compare", "bar-chart-line", "📊"),
     ("P&L Tracker", "journal-text", "📒"),
     ("Alerts", "bell", "🔔"),
+    # Help & config
     ("Information", "info-circle", "ℹ️"),
     ("Settings", "gear", "⚙️"),
 ]

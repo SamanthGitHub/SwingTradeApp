@@ -136,8 +136,8 @@ def fetch_channel_uploads(channel_id: str, channel_name: str,
                 pub_str = dt.astimezone().strftime("%b %d, %H:%M")
             except Exception:
                 pass
-        if ts and ts < cutoff:
-            continue
+        if not ts or ts < cutoff:
+            continue  # unknown or older than the lookback window
         desc = ""
         group = entry.find("media:group", _YT_NS)
         if group is not None:
@@ -170,15 +170,29 @@ def fetch_transcript_segments(video_id: str) -> Optional[List[Segment]]:
         from youtube_transcript_api import YouTubeTranscriptApi
     except Exception:
         return None
+
+    langs = ["en", "en-US", "en-GB"]
+
+    def _attempt() -> Optional[List[dict]]:
+        try:  # ≥1.0 instance API, English preferred
+            fetched = YouTubeTranscriptApi().fetch(video_id, languages=langs)
+        except TypeError:  # signature without languages kwarg
+            fetched = YouTubeTranscriptApi().fetch(video_id)
+        except Exception:  # ≤0.6 classmethod API
+            return YouTubeTranscriptApi.get_transcript(video_id, languages=langs)
+        return [{"text": getattr(s, "text", ""), "start": getattr(s, "start", 0.0)} for s in fetched]
+
     raw = None
-    try:  # ≥1.0 instance API
-        fetched = YouTubeTranscriptApi().fetch(video_id)
-        raw = [{"text": getattr(s, "text", ""), "start": getattr(s, "start", 0.0)} for s in fetched]
-    except Exception:
-        try:  # ≤0.6 classmethod API
-            raw = YouTubeTranscriptApi.get_transcript(video_id)
+    for attempt in range(2):  # one retry — transcript endpoint throttles intermittently
+        try:
+            raw = _attempt()
+            if raw:
+                break
         except Exception:
-            return None
+            pass
+        if attempt == 0:
+            import time
+            time.sleep(0.4)
     if not raw:
         return None
     try:
@@ -210,6 +224,9 @@ NAME_TO_TICKER: Dict[str, str] = {
     "paypal": "PYPL", "shopify": "SHOP", "salesforce": "CRM", "oracle": "ORCL",
     "qualcomm": "QCOM", "snowflake": "SNOW", "crowdstrike": "CRWD",
     "eli lilly": "LLY", "costco": "COST", "ford motor": "F", "general motors": "GM",
+    # Indices / broad ETFs (finfluencers talk macro constantly).
+    "s&p 500": "SPY", "s and p 500": "SPY", "nasdaq 100": "QQQ",
+    "russell 2000": "IWM", "dow jones": "DIA",
 }
 
 # All-caps words that are also valid tickers — ignored unless cash-tagged.
@@ -222,6 +239,12 @@ _TICKER_STOPWORDS: Set[str] = {
 
 _CASHTAG_RE = re.compile(r"\$([A-Za-z]{1,5})\b")
 _UPPER_RE = re.compile(r"\b([A-Z]{2,5})\b")
+# Word-boundary patterns so "artificial intelligence" ≠ INTC and "afford" ≠ F.
+# Longest names first so "advanced micro devices" wins before any shorter overlap.
+_NAME_PATTERNS = [
+    (re.compile(r"\b" + re.escape(name) + r"\b"), sym)
+    for name, sym in sorted(NAME_TO_TICKER.items(), key=lambda kv: -len(kv[0]))
+]
 
 
 def extract_tickers(text: str, universe: Set[str]) -> Counter:
@@ -236,8 +259,8 @@ def extract_tickers(text: str, universe: Set[str]) -> Counter:
         if sym not in _TICKER_STOPWORDS and sym in universe:
             found[sym] += 1
     low = text.lower()
-    for name, sym in NAME_TO_TICKER.items():
-        c = low.count(name)
+    for pat, sym in _NAME_PATTERNS:
+        c = len(pat.findall(low))
         if c:
             found[sym] += c
     return found
@@ -275,13 +298,49 @@ _DIRECTION = {
              "avoid", "puts on", "take profit"],
     "hold": ["hold", "holding", "hodl", "wait on"],
 }
-_PT_CONTEXT_RE = re.compile(
-    r"(?:price target|target of|sees|see it at|hits?|reach(?:es)?|"
-    r"go(?:es)? to|going to|up to)\s+\$?\s?(\d{1,5}(?:\.\d{1,2})?)", re.I)
+# Price targets: "price target 220" / "target of 220" (no $ needed) OR a verb + an explicit
+# "$220" (the $ avoids capturing "to 5 years" / "go to 5 percent" as a $5 target).
+_PT_RE = re.compile(
+    r"(?:price target|target of|target at|target\s+is)\s+\$?\s?(\d{1,5}(?:\.\d{1,2})?)"
+    r"|(?:sees|hits?|reach(?:es)?|going to|go(?:es)? to|up to|to)\s+\$\s?(\d{1,5}(?:\.\d{1,2})?)",
+    re.I)
+_PT_BAD_SUFFIX = re.compile(r"^\s*(?:%|percent|year|month|week|day|x\b)", re.I)
 _HORIZON_RE = re.compile(
     r"(by (?:the )?end of (?:the )?(?:year|month|quarter)|year[- ]end|"
     r"next (?:week|month|quarter|year)|\d+\s*(?:day|week|month|year)s?|"
     r"long[- ]term|short[- ]term)", re.I)
+
+
+def _find_target(text: str) -> Optional[float]:
+    """First plausible price target, skipping numbers that are really %/durations."""
+    for m in _PT_RE.finditer(text):
+        num = m.group(1) or m.group(2)
+        if not num or _PT_BAD_SUFFIX.match(text[m.end():]):
+            continue
+        try:
+            return float(num)
+        except ValueError:
+            continue
+    return None
+
+
+def _call_context(segments: List["Segment"], i: int, universe: Set[str],
+                  sym: str, max_chars: int = 160) -> str:
+    """Text of segment ``i`` plus a short lookahead — so a call whose direction/target lands a
+    caption or two later isn't lost. The lookahead stops as soon as a *different* ticker
+    appears, to avoid attributing the next ticker's target to this one."""
+    parts = [segments[i].text]
+    size = len(segments[i].text)
+    j = i + 1
+    while j < len(segments) and size < max_chars:
+        nxt = segments[j].text
+        other = extract_tickers(nxt, universe)
+        if other and set(other) != {sym}:
+            break
+        parts.append(nxt)
+        size += len(nxt)
+        j += 1
+    return " ".join(parts)
 
 
 @dataclass
@@ -303,23 +362,18 @@ def extract_picks(video_id: str, segments: List[Segment], universe: Set[str]) ->
     """
     picks: List[Pick] = []
     seen: Set[tuple] = set()
-    for seg in segments:
+    for i, seg in enumerate(segments):
         tickers = extract_tickers(seg.text, universe)
-        if len(tickers) != 1:
+        if len(tickers) != 1:  # anchor on a segment naming exactly one ticker
             continue
         sym = next(iter(tickers))
-        low = seg.text.lower()
+        ctx = _call_context(segments, i, universe, sym)
+        low = ctx.lower()
         direction = next((d for d, words in _DIRECTION.items()
                           if any(w in low for w in words)), None)
-        target = None
-        mt = _PT_CONTEXT_RE.search(seg.text)
-        if mt:
-            try:
-                target = float(mt.group(1))
-            except ValueError:
-                target = None
+        target = _find_target(ctx)
         horizon = None
-        mh = _HORIZON_RE.search(seg.text)
+        mh = _HORIZON_RE.search(ctx)
         if mh:
             horizon = mh.group(1).strip()
         if direction is None and target is None:
@@ -328,7 +382,7 @@ def extract_picks(video_id: str, segments: List[Segment], universe: Set[str]) ->
         if key in seen:
             continue
         seen.add(key)
-        picks.append(Pick(sym, direction, target, horizon, seg.text.strip(),
+        picks.append(Pick(sym, direction, target, horizon, ctx.strip(),
                           int(seg.start), deep_link(video_id, seg.start)))
     return picks
 
@@ -448,6 +502,7 @@ class VideoAnalysis:
     flags: Dict[str, List[str]]
     digest: str
     conviction: Dict[str, float] = field(default_factory=dict)
+    ticker_sentiment: Dict[str, str] = field(default_factory=dict)
 
 
 def analyze_video(upload: Upload, segments: Optional[List[Segment]], universe: Set[str], *,
@@ -475,13 +530,23 @@ def analyze_video(upload: Upload, segments: Optional[List[Segment]], universe: S
         except Exception:
             pass
 
+    # Per-ticker sentiment from the segments that actually name each ticker (falls back to the
+    # whole-video read when a ticker only surfaced via a cross-segment name match).
+    snips_by: Dict[str, List[str]] = {}
+    for m in mentions:
+        snips_by.setdefault(m.ticker, []).append(m.snippet)
+    ticker_sentiment = {
+        sym: _sentiment(" ".join(snips_by.get(sym, []))[:1500] or text, analyzer)[0]
+        for sym in tickers
+    }
+
     conviction = {sym: score_conviction(text, cnt) for sym, cnt in tickers.items()}
     return VideoAnalysis(
         upload=upload, has_transcript=has_tx, text=text,
         sentiment=sentiment, sentiment_score=sscore, tickers=tickers,
         mentions=mentions, picks=picks, events=events,
         flags=scan_flags(text), digest=_digest(text, upload, summarizer),
-        conviction=conviction,
+        conviction=conviction, ticker_sentiment=ticker_sentiment,
     )
 
 
@@ -498,9 +563,10 @@ def ticker_consensus(analyses: List[VideoAnalysis]) -> List[Dict]:
             d["videos"] += 1
             d["channels"].add(a.upload.channel)
             d["conviction"] = max(d["conviction"], a.conviction.get(sym, 0.0))
-            if a.sentiment == "bullish":
+            tsent = a.ticker_sentiment.get(sym, a.sentiment)  # per-ticker, not whole-video
+            if tsent == "bullish":
                 d["bull"] += 1
-            elif a.sentiment == "bearish":
+            elif tsent == "bearish":
                 d["bear"] += 1
     rows: List[Dict] = []
     for d in agg.values():
@@ -522,59 +588,128 @@ def make_pick_id(video_id: str, ticker: str, direction: Optional[str]) -> str:
 
 
 def record_picks(store: Dict, analysis: VideoAnalysis,
-                 price_at_mention_fn: Callable[[str], Optional[float]],
+                 price_on_fn: Callable[[str, str], Optional[float]],
                  today: Optional[str] = None) -> int:
-    """Append any *new* picks from ``analysis`` to ``store['picks']`` with entry price.
+    """Append any *new* picks from ``analysis`` to ``store['picks']``.
 
-    Idempotent per (video, ticker, direction) so re-scanning a video doesn't double-log.
-    Returns the number of newly recorded picks.
+    The call is dated to the video's **publish date** and the entry price is the close on that
+    date (``price_on_fn(ticker, date)``), not the scan-time price — otherwise a creator's track
+    record would be graded from whenever you happened to run the scan. Idempotent per
+    (video, ticker, direction). Returns the number of newly recorded picks.
     """
-    today = today or datetime.now().strftime("%Y-%m-%d")
+    up = analysis.upload
+    call_date = None
+    if up.published_ts:
+        try:
+            call_date = datetime.fromtimestamp(up.published_ts).strftime("%Y-%m-%d")
+        except Exception:
+            call_date = None
+    call_date = call_date or today or datetime.now().strftime("%Y-%m-%d")
+
     picks = store.setdefault("picks", [])
     existing = {p["id"] for p in picks}
     added = 0
     for pk in analysis.picks:
-        pid = make_pick_id(analysis.upload.video_id, pk.ticker, pk.direction)
+        pid = make_pick_id(up.video_id, pk.ticker, pk.direction)
         if pid in existing:
             continue
         picks.append({
-            "id": pid, "channel": analysis.upload.channel,
-            "channel_id": analysis.upload.channel_id, "video_id": analysis.upload.video_id,
-            "video_title": analysis.upload.title, "video_url": analysis.upload.url,
+            "id": pid, "channel": up.channel, "channel_id": up.channel_id,
+            "video_id": up.video_id, "video_title": up.title, "video_url": up.url,
             "ticker": pk.ticker, "direction": pk.direction,
             "price_target": pk.price_target, "horizon": pk.horizon,
             "snippet": pk.snippet, "timestamp_sec": pk.timestamp_sec, "deep_link": pk.deep_link,
-            "mention_date": today, "price_at_mention": price_at_mention_fn(pk.ticker),
+            "mention_date": call_date, "price_at_mention": price_on_fn(pk.ticker, call_date),
         })
         existing.add(pid)
         added += 1
     return added
 
 
+_DEFAULT_MATURE_DAYS = 90
+
+
+def _horizon_to_days(horizon: Optional[str]) -> Optional[int]:
+    """Approximate a stated horizon ('by end of year', '6 months', 'long-term') in days."""
+    if not horizon:
+        return None
+    h = horizon.lower()
+    m = re.search(r"(\d+)\s*(day|week|month|year)", h)
+    if m:
+        return int(m.group(1)) * {"day": 1, "week": 7, "month": 30, "year": 365}[m.group(2)]
+    if "year" in h:
+        return 180 if ("end of" in h or "year-end" in h or "year end" in h) else 365
+    if "quarter" in h:
+        return 90
+    if "month" in h:
+        return 30
+    if "week" in h:
+        return 7
+    if "long" in h:
+        return 365
+    if "short" in h:
+        return 30
+    return None
+
+
 def grade_picks(picks: List[Dict],
                 current_price_fn: Callable[[str], Optional[float]],
-                bench_return_fn: Callable[[str], Optional[float]]) -> List[Dict]:
-    """Annotate each stored pick with return, directional return, and alpha vs benchmark.
+                bench_return_fn: Callable[[str], Optional[float]],
+                peak_since_fn: Optional[Callable[[str, str], Optional[float]]] = None,
+                today: Optional[str] = None) -> List[Dict]:
+    """Annotate each stored pick with return, alpha vs SPY, and a *decided* win/loss.
 
-    ``bench_return_fn(mention_date)`` returns the benchmark (SPY) fractional return since that
-    date. A short/sell call profits from a decline, so its directional return is negated.
+    Grading respects the stated horizon: a call is only marked win/loss once the horizon has
+    elapsed (default 90d when none was stated) — except a long call whose **price target was
+    hit** counts as a win immediately. ``hold`` calls aren't directional, so they're excluded
+    from win/loss. A short/sell call profits from a decline (directional return negated).
+    ``bench_return_fn(date)`` and ``peak_since_fn(ticker, date)`` are point-in-time lookups.
     """
+    today_dt = datetime.strptime(today, "%Y-%m-%d") if today else datetime.now()
     graded: List[Dict] = []
     for p in picks:
         rec = dict(p)
         entry = p.get("price_at_mention")
+        direction = p.get("direction")
+        mdate = p.get("mention_date", "")
         cur = current_price_fn(p["ticker"]) if entry else None
+
+        hdays = _horizon_to_days(p.get("horizon"))
+        try:
+            age = (today_dt - datetime.strptime(mdate, "%Y-%m-%d")).days
+        except Exception:
+            age = None
+        matured = age is not None and age >= (hdays if hdays is not None else _DEFAULT_MATURE_DAYS)
+        rec["horizon_days"], rec["age_days"], rec["matured"] = hdays, age, matured
+
+        target_hit = None
+        tgt = p.get("price_target")
+        if peak_since_fn is not None and tgt and direction in (None, "buy"):
+            peak = peak_since_fn(p["ticker"], mdate)
+            if peak is not None:
+                target_hit = bool(peak >= tgt)
+        rec["target_hit"] = target_hit
+
         if entry and cur and entry > 0:
             raw = (cur - entry) / entry
-            directional = -raw if p.get("direction") == "sell" else raw
-            bench = bench_return_fn(p.get("mention_date", ""))
+            directional = -raw if direction == "sell" else raw
+            bench = bench_return_fn(mdate)
             rec["return_pct"] = round(raw * 100, 2)
             rec["directional_pct"] = round(directional * 100, 2)
             rec["alpha_pct"] = round((directional - bench) * 100, 2) if bench is not None else None
-            rec["win"] = bool(directional > 0)
+            if direction == "hold":
+                rec["win"] = None            # not a directional call
+            elif target_hit:
+                rec["win"] = True            # reached the stated target → correct
+            elif matured:
+                rec["win"] = bool(directional > 0)
+            else:
+                rec["win"] = None            # still pending its horizon
+            rec["status"] = "pending" if rec["win"] is None else ("win" if rec["win"] else "loss")
         else:
             rec["return_pct"] = rec["directional_pct"] = rec["alpha_pct"] = None
             rec["win"] = None
+            rec["status"] = "ungraded"
         graded.append(rec)
     return graded
 
@@ -586,12 +721,12 @@ def creator_leaderboard(graded: List[Dict]) -> List[Dict]:
         c = by.setdefault(p["channel"], {"channel": p["channel"], "picks": 0, "wins": 0,
                                          "graded": 0, "alpha_sum": 0.0, "alpha_n": 0})
         c["picks"] += 1
-        if p.get("win") is not None:
+        if p.get("win") is not None:  # only decided picks count toward the record
             c["graded"] += 1
             c["wins"] += int(bool(p["win"]))
-        if p.get("alpha_pct") is not None:
-            c["alpha_sum"] += p["alpha_pct"]
-            c["alpha_n"] += 1
+            if p.get("alpha_pct") is not None:
+                c["alpha_sum"] += p["alpha_pct"]
+                c["alpha_n"] += 1
     rows: List[Dict] = []
     for c in by.values():
         rows.append({
