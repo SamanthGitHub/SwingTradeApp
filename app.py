@@ -1505,7 +1505,9 @@ def run_dashboard() -> None:
         page_title="SwingTrade Pro Dashboard",
         page_icon="📈",
         layout="wide",
-        initial_sidebar_state="expanded",  # keep the nav open; users collapse it via the hamburger
+        # "auto" = expanded on desktop, collapsed on mobile (so the nav doesn't overlay the page).
+        # Safe now that the » reopen control is always visible (see ui.py).
+        initial_sidebar_state="auto",
     )
 
     ui.inject_theme()

@@ -61,12 +61,24 @@ html, body, [class*="css"], .stMarkdown, button, input, select, textarea {{
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 }}
 
-/* Hide default Streamlit chrome that reads as "unfinished". Keep the header transparent
-   (not display:none) so the sidebar collapse control survives. */
-#MainMenu {{visibility: hidden;}}
+/* Hide ONLY the cosmetic chrome (footer, the dev "Deploy" button, the ⋮ menu). Do NOT hide the
+   whole toolbar/header — that's what removed Streamlit's native sidebar expand (») control and made
+   a collapsed nav impossible to reopen. The header/toolbar structure must survive. */
 footer {{visibility: hidden;}}
-[data-testid="stToolbar"] {{display: none;}}
 [data-testid="stHeader"] {{background: transparent;}}
+[data-testid="stAppDeployButton"] {{display: none !important;}}
+#MainMenu, [data-testid="stMainMenu"] {{visibility: hidden;}}
+
+/* Make the expand-sidebar (») control unmistakable so a collapsed nav is always reopenable. */
+[data-testid="stExpandSidebarButton"], [data-testid="stSidebarCollapseButton"] {{
+    visibility: visible !important; opacity: 1 !important;
+    z-index: 1000000 !important; pointer-events: auto !important;
+}}
+[data-testid="stExpandSidebarButton"] {{
+    background: var(--secondary-background-color) !important;
+    border: 1px solid rgba(128,128,128,.30) !important; border-radius: 0.5rem !important;
+    box-shadow: 0 2px 8px rgba(0,0,0,.14) !important;
+}}
 
 @keyframes brandShift {{ 0% {{background-position: 0% 50%;}} 50% {{background-position: 100% 50%;}} 100% {{background-position: 0% 50%;}} }}
 @keyframes livePulse {{ 0%,100% {{opacity: 1; box-shadow: 0 0 0 0 rgba(0,255,106,.55);}} 50% {{opacity: .55; box-shadow: 0 0 0 7px rgba(0,255,106,0);}} }}
@@ -198,6 +210,20 @@ footer {{visibility: hidden;}}
     h1 {{ font-size: 1.5rem; }}
     h2 {{ font-size: 1.2rem; }}
     h3 {{ font-size: 1.05rem; }}
+    /* Mobile: the nav auto-collapses — make the » reopen control a big, obvious, pinned tap
+       target so it's never missed. */
+    [data-testid="stExpandSidebarButton"] {{
+        position: fixed !important; top: 0.5rem; left: 0.5rem; z-index: 1000001 !important;
+        padding: 0.45rem 0.6rem !important;
+        background: linear-gradient(110deg, {ACCENT}, {ACCENT_DARK}) !important;
+        border: none !important; box-shadow: 0 3px 12px rgba(0,0,0,.28) !important;
+    }}
+    [data-testid="stExpandSidebarButton"] svg {{ width: 1.5rem !important; height: 1.5rem !important; color: #fff !important; }}
+    /* full-width, easy-to-tap buttons in the main area */
+    [data-testid="stMain"] .stButton > button,
+    [data-testid="stMain"] .stDownloadButton > button {{ width: 100% !important; }}
+    /* the in-page Scan-now control rows shouldn't squeeze side-by-side on a phone */
+    [data-testid="stMain"] [data-testid="stColumn"]:has(.stButton) {{ min-width: 100% !important; }}
 }}
 </style>
 """
