@@ -1464,7 +1464,7 @@ def run_dashboard() -> None:
         page_title="SwingTrade Pro Dashboard",
         page_icon="📈",
         layout="wide",
-        initial_sidebar_state="expanded",
+        initial_sidebar_state="auto",  # auto-collapses the nav on phones for more screen
     )
 
     ui.inject_theme()

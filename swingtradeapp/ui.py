@@ -168,6 +168,35 @@ footer {{visibility: hidden;}}
 
 .metric-positive {{color: {ACCENT}; font-weight: bold;}}
 .metric-negative {{color: #ff4444; font-weight: bold;}}
+
+/* ── Mobile / small-screen optimization ──────────────────────────────────────── */
+@media (max-width: 640px) {{
+    /* reclaim horizontal space (Streamlit's default desktop padding is large) */
+    .block-container, [data-testid="stMainBlockContainer"] {{
+        padding: 1rem 0.75rem 3rem !important;
+    }}
+    /* header stacks + shrinks instead of overflowing the viewport */
+    .brand-header {{
+        flex-direction: column; align-items: flex-start; gap: 0.5rem; padding: 0.85rem 1rem;
+    }}
+    .brand-header h1 {{ font-size: 1.35rem; }}
+    .brand-header p {{ font-size: 0.78rem; }}
+    /* let column rows wrap to 2-up instead of cramming many tiny columns across */
+    [data-testid="stHorizontalBlock"] {{ flex-wrap: wrap; gap: 0.5rem; }}
+    [data-testid="stColumn"], [data-testid="column"] {{
+        min-width: 45% !important; flex-basis: 45% !important;
+    }}
+    /* tighter but still-legible metric cards */
+    [data-testid="stMetric"] {{ padding: 0.7rem 0.7rem 0.7rem 0.9rem; }}
+    [data-testid="stMetricValue"] {{ font-size: 1.3rem; }}
+    /* pill tabs scroll sideways rather than stacking into many rows */
+    .stTabs [data-baseweb="tab-list"] {{
+        overflow-x: auto; flex-wrap: nowrap; -webkit-overflow-scrolling: touch;
+    }}
+    h1 {{ font-size: 1.5rem; }}
+    h2 {{ font-size: 1.2rem; }}
+    h3 {{ font-size: 1.05rem; }}
+}}
 </style>
 """
 
