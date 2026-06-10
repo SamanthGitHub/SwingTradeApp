@@ -1470,6 +1470,15 @@ def run_dashboard() -> None:
     ui.inject_theme()
     ui.render_header()
 
+    # On hosted deploys (e.g. Streamlit Community Cloud) secrets live in st.secrets, but the config
+    # reads os.environ — copy them across so ALPACA_*/cost overrides take effect. No-op locally /
+    # when no secrets are defined, so the app stays in offline mode.
+    try:
+        for _k, _v in st.secrets.items():
+            os.environ.setdefault(_k, str(_v))
+    except Exception:
+        pass
+
     config = get_config()
     # Apply live cost-model overrides set on the Settings page (survive cache clears).
     if "slippage_bps" in st.session_state:
