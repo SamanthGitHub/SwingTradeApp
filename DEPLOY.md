@@ -40,6 +40,18 @@ The dashboard works fully without this; it just won't place orders. To turn exec
 2. Save. The app already copies `st.secrets` into the environment at startup, so the config picks
    these up automatically — no redeploy/code change needed. (Use **paper** keys for safety.)
 
+## 3b. Login (required on a public URL)
+The app gates access with a username/password login (streamlit-authenticator). On the free tier
+`.data/` is **ephemeral**, so seed the admin and pin the cookie key via **Settings → Secrets**:
+```toml
+APP_ADMIN_USER = "you"
+APP_ADMIN_PASSWORD = "a-strong-password"
+AUTH_COOKIE_KEY = "a-long-random-string-keep-stable"   # so logins survive restarts
+```
+The app copies `st.secrets` into the environment at startup, so it seeds the same admin on every
+cold start and the session cookie stays valid. (Locally these go in `.env` instead; leave
+`APP_ADMIN_PASSWORD` blank to have one generated and shown once.)
+
 ## 4. Things to know on the free tier
 - **Storage is ephemeral.** Caches in `.data/` regenerate fine, but the **P&L journal, watchlists,
   and alerts** (JSON files) **reset on every reboot/redeploy**. Persisting them needs an external

@@ -1,0 +1,23 @@
+# SwingTrade Pro — login config TEMPLATE.
+#
+# You normally DON'T edit this by hand: on first run the app auto-creates
+# `.data/auth_config.yaml` (gitignored), seeding an admin from APP_ADMIN_USER /
+# APP_ADMIN_PASSWORD (env or .env), or generating a random password it shows once
+# and writes to `.data/INITIAL_ADMIN_PASSWORD.txt`.
+#
+# This file just documents the format. To manage users by hand, copy it to
+# `.data/auth_config.yaml` and replace each `password` with a bcrypt hash:
+#   ~/.swingtradeapp/venv/bin/python -c "import streamlit_authenticator as s; print(s.Hasher.hash('your-password'))"
+
+credentials:
+  usernames:
+    admin:
+      name: Admin
+      email: admin@example.com
+      # bcrypt hash of the password (NEVER store plaintext). Generate with the one-liner above.
+      password: $2b$12$REPLACE_WITH_A_REAL_BCRYPT_HASH......................
+
+cookie:
+  name: swingtrade_auth        # browser cookie name
+  key: change-me-to-a-long-random-string   # signs the session cookie — keep secret & stable
+  expiry_days: 30              # how long a login stays valid

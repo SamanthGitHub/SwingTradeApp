@@ -36,6 +36,7 @@ from swingtradeapp.risk import BayesianKellySizer
 from swingtradeapp.signals import TrendSignalGenerator
 from swingtradeapp.tickers import get_raw_screen, get_screening_universe, get_tradable_universe
 from swingtradeapp import ui
+from swingtradeapp import auth
 from swingtradeapp import youtube as yt
 from swingtradeapp import confluence as cf
 from swingtradeapp import analysis_guide as ag
@@ -1652,6 +1653,10 @@ def run_dashboard() -> None:
         config.slippage_bps = st.session_state["slippage_bps"]
         config.commission_bps = st.session_state["commission_bps"]
     watchlist_mgr = get_watchlist_manager()
+
+    # Login gate — renders the form (under the header) and stops here until authenticated.
+    # Placed after get_config() so .env / st.secrets (APP_ADMIN_*, AUTH_COOKIE_KEY) are loaded.
+    auth.require_login()
 
     page = ui.render_nav()
 
