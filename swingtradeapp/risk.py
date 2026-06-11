@@ -114,10 +114,14 @@ class BayesianKellySizer:
         self,
         signal: Signal,
         account_size: float = 100_000,
+        win_prob: Optional[float] = None,
     ) -> PositionSize:
         """
         Compute half-Kelly position size, then apply portfolio guards.
         Returns zero allocation if circuit breaker is tripped or portfolio is full.
+
+        ``win_prob`` (e.g. a calibrated ML P(up)) overrides the score-blended prior win rate when
+        provided — it's shrunk toward 0.5 so an overconfident estimate can't blow up the fraction.
         """
         # Circuit breaker
         if self.portfolio.halted:
@@ -135,8 +139,12 @@ class BayesianKellySizer:
             logger.info("Max concurrent positions reached (%d)", MAX_CONCURRENT_POSITIONS)
             return PositionSize(fraction=0.0, dollars=0.0)
 
-        # Bayesian Kelly
-        win_rate = self._score_adjusted_win_rate(signal.score)
+        # Bayesian Kelly. Prefer a calibrated per-symbol probability when supplied; otherwise blend
+        # the global prior with the signal's quality score.
+        if win_prob is not None:
+            win_rate = self._shrink_prob(float(win_prob))
+        else:
+            win_rate = self._score_adjusted_win_rate(signal.score)
         avg_win = self.prior_avg_win
         avg_loss = max(self.prior_avg_loss, 1e-6)
         odds = avg_win / avg_loss
@@ -170,6 +178,14 @@ class BayesianKellySizer:
         self._save_state()
 
     # ── Internal ───────────────────────────────────────────────────────────────
+
+    def _shrink_prob(self, prob: float, pseudo: float = 10.0) -> float:
+        """Shrink a model probability toward 0.5 (Beta pseudo-count), then cap — guards against an
+        overconfident estimate producing too large a Kelly fraction (same idea as the backtest
+        prior shrink). ``pseudo`` ≈ equivalent prior trades pulling toward 0.5."""
+        p = min(max(prob, 0.0), 1.0)
+        shrunk = (p * 50.0 + 0.5 * pseudo) / (50.0 + pseudo)
+        return min(shrunk, 0.95)
 
     def _score_adjusted_win_rate(self, score: float) -> float:
         """
