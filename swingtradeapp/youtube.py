@@ -431,6 +431,164 @@ def scan_flags(text: str) -> Dict[str, List[str]]:
     }
 
 
+# ── Promotional-content filtering + analysis-point extraction ─────────────────────
+# Finfluencer videos are heavy with non-analysis filler. We strip it before any analysis runs so
+# the digest / sentiment / mentions reflect what they actually said about the market, not their
+# like-and-subscribe / sponsor / referral spiel.
+
+# Unambiguous CTAs / sponsor / affiliate language that never appears in genuine market analysis —
+# a segment matching any of these is promo even if it also names a ticker (e.g. referral spiels).
+_HARD_PROMO = [
+    "like and subscribe", "smash the like", "smash that like", "hit the like",
+    "hit that like", "like button", "drop a like", "leave a like", "give it a like",
+    "ring the bell", "notification bell", "turn on notifications", "hit the bell",
+    "link in the description", "link in description", "link below", "links below",
+    "down in the description", "check the description", "in the description below",
+    "promo code", "use code", "use my code", "coupon code", "discount code",
+    "sponsored by", "today's sponsor", "todays sponsor", "this video is sponsored",
+    "for sponsoring", "thanks to our sponsor", "brought to you by", "our sponsor",
+    "patreon", "discord", "join my", "my course", "my newsletter", "sign up bonus",
+    "free stock", "giveaway", "referral", "affiliate", "my membership", "my patreon",
+    "merch", "comment below", "let me know in the comments", "smash that subscribe",
+    "subscribe to the channel", "hit subscribe", "hit the subscribe",
+]
+
+# Softer plugs — only count as promo when the segment names NO ticker, so we never strip
+# ticker-bearing analysis on a weak match.
+_SOFT_PROMO = [
+    "subscribe", "my channel", "this channel", "check out the", "hit that",
+    "the comment section", "share this video", "share the video",
+]
+# NOTE: disclaimers ("not financial advice", "do your own research") are intentionally NOT promo
+# (kept per product decision).
+
+_PRICE_RE = re.compile(r"\$\s?\d{1,5}(?:\.\d{1,2})?")
+_PCT_RE = re.compile(r"\d{1,3}(?:\.\d{1,2})?\s?%")
+_ANALYSIS_WORDS = [
+    "price target", "target", "support", "resistance", "valuation", "valued", "undervalued",
+    "overvalued", "fair value", "p/e", "pe ratio", "earnings", "revenue", "guidance",
+    "catalyst", "breakout", "breakdown", "upside", "downside", "margins", "cash flow",
+    "buyback", "dividend", "moving average", "all-time high", "free cash flow",
+]
+
+
+def is_promotional(text: str, has_ticker: bool = False) -> bool:
+    """True when a line is promotional filler rather than analysis.
+
+    Hard CTAs/sponsor/affiliate phrases are promo regardless of any ticker; softer plugs only
+    count when the line names no ticker. Disclaimers are intentionally NOT treated as promo.
+    """
+    if not text:
+        return False
+    low = text.lower()
+    if any(p in low for p in _HARD_PROMO):
+        return True
+    if not has_ticker and any(p in low for p in _SOFT_PROMO):
+        return True
+    return False
+
+
+def strip_promotional_segments(segments: List[Segment], universe: Set[str]) -> List[Segment]:
+    """Drop promotional segments, preserving the originals' timestamps (deep links stay valid)."""
+    kept: List[Segment] = []
+    for seg in segments:
+        has_ticker = bool(extract_tickers(seg.text, universe))
+        if not is_promotional(seg.text, has_ticker):
+            kept.append(seg)
+    return kept
+
+
+def clean_analysis_text(text: str, universe: Optional[Set[str]] = None) -> str:
+    """Sentence-level promo strip for free text (e.g. a video description full of links/sponsors)."""
+    if not text:
+        return ""
+    uni = universe or set()
+    sents = re.split(r"(?<=[.!?])\s+", text.strip())
+    kept = [s for s in sents if not is_promotional(s, bool(extract_tickers(s, uni)))]
+    return " ".join(kept).strip()
+
+
+def _analysis_score(sentence: str, universe: Set[str]) -> int:
+    """How much analytical substance a sentence carries (tickers, $/% figures, analysis words)."""
+    low = sentence.lower()
+    score = 0
+    if extract_tickers(sentence, universe):
+        score += 2
+    if _PRICE_RE.search(sentence):
+        score += 2
+    if _PCT_RE.search(sentence):
+        score += 1
+    score += sum(1 for w in _ANALYSIS_WORDS if w in low)
+    score += sum(1 for words in _DIRECTION.values() for w in words if w in low)
+    return score
+
+
+def extract_analysis_points(segments: List[Segment], universe: Set[str],
+                            max_points: int = 5) -> List[str]:
+    """The most analysis-dense sentences from (already promo-stripped) segments.
+
+    Surfaces the 'critical analytics' — price levels, targets, valuations, catalysts, % moves —
+    de-duplicated, trimmed, and returned in the order they were spoken. Returns [] when nothing
+    scores high enough.
+    """
+    if not segments:
+        return []
+    # Break into units: split each segment on sentence punctuation (handles written text such as
+    # descriptions); unpunctuated auto-captions stay whole. Then group consecutive units into
+    # ~sentence-sized windows so points read as crisp bullets either way.
+    units: List[tuple] = []  # (seg_index, text)
+    for i, seg in enumerate(segments):
+        for piece in re.split(r"(?<=[.!?])\s+", (seg.text or "").strip()):
+            piece = piece.strip()
+            if piece:
+                units.append((i, piece))
+
+    windows: List[tuple] = []  # (seg_index, text)
+    buf: List[str] = []
+    start_idx = 0
+    cur_len = 0
+    buf_tickers: Set[str] = set()
+
+    def _flush():
+        nonlocal buf, cur_len, buf_tickers
+        if buf:
+            windows.append((start_idx, " ".join(buf)))
+        buf, cur_len, buf_tickers = [], 0, set()
+
+    for idx, piece in units:
+        piece_tickers = set(extract_tickers(piece, universe))
+        # Start a fresh window when a *different* ticker enters — keeps one idea per bullet.
+        if buf and piece_tickers and buf_tickers and not (piece_tickers & buf_tickers):
+            _flush()
+        if not buf:
+            start_idx = idx
+        buf.append(piece)
+        buf_tickers |= piece_tickers
+        cur_len += len(piece) + 1
+        if piece.endswith((".", "!", "?")) or cur_len >= 180:
+            _flush()
+    _flush()
+
+    scored = []
+    seen: Set[str] = set()
+    for idx, w in windows:
+        s = w.strip()
+        if len(s) < 25:
+            continue
+        sc = _analysis_score(s, universe)
+        if sc < 2:
+            continue
+        key = s.lower()[:60]
+        if key in seen:
+            continue
+        seen.add(key)
+        scored.append((sc, idx, s if len(s) <= 200 else s[:197].rstrip() + "…"))
+    # Top-scoring first, then restore chronological order among the picks.
+    top = sorted(scored, key=lambda t: t[0], reverse=True)[:max_points]
+    top.sort(key=lambda t: t[1])
+    return [snip for _, _, snip in top]
+
+
 # ── Conviction + sentiment + digest ──────────────────────────────────────────────
 
 _CONVICTION_WORDS = [
@@ -480,7 +638,11 @@ def _sentiment(text: str, analyzer) -> tuple:
     return ("bullish" if b > s else "bearish"), round(conf, 3)
 
 
-def _digest(text: str, upload: "Upload", summarizer) -> str:
+def _digest(text: str, upload: "Upload", summarizer,
+            analysis_points: Optional[List[str]] = None) -> str:
+    """Short summary built from the **promo-stripped** text. Uses the local summarizer when
+    available, else falls back to the extracted analysis points (so the digest stays analysis-only
+    even without the optional AI model)."""
     if summarizer is not None and text:
         try:
             chunks = [text[i:i + 1000] for i in range(0, min(len(text), 3000), 1000)]
@@ -490,7 +652,9 @@ def _digest(text: str, upload: "Upload", summarizer) -> str:
                 return d[:600]
         except Exception:
             pass
-    base = upload.description or text
+    if analysis_points:
+        return " ".join(analysis_points[:3])[:400]
+    base = text or upload.description
     sents = re.split(r"(?<=[.!?])\s+", base.strip())
     return " ".join(sents[:2])[:400]
 
@@ -510,18 +674,30 @@ class VideoAnalysis:
     digest: str
     conviction: Dict[str, float] = field(default_factory=dict)
     ticker_sentiment: Dict[str, str] = field(default_factory=dict)
+    analysis_points: List[str] = field(default_factory=list)
 
 
 def analyze_video(upload: Upload, segments: Optional[List[Segment]], universe: Set[str], *,
                   analyzer=None, event_classifier=None, summarizer=None) -> VideoAnalysis:
-    """Full per-video analysis. Falls back to title+description when there's no transcript."""
+    """Full per-video analysis. Falls back to title+description when there's no transcript.
+
+    Promotional filler (like/subscribe CTAs, sponsor reads, referral spiels) is stripped up front
+    so the digest, sentiment, mentions and conviction reflect the *analysis* only.
+    """
     has_tx = bool(segments)
     if segments:
-        text = segments_text(segments)
-        segs = segments
+        raw_segs = segments
     else:
-        text = f"{upload.title}. {upload.description}".strip()
-        segs = [Segment(text=text, start=0.0)]
+        # No transcript: fall back to title + a promo-cleaned description.
+        desc = clean_analysis_text(upload.description, universe)
+        raw_segs = [Segment(text=f"{upload.title}. {desc}".strip(), start=0.0)]
+
+    raw_text = segments_text(raw_segs)
+    segs = strip_promotional_segments(raw_segs, universe)
+    # Safety: never blank a video to over-eager matching — keep the raw segments if too much went.
+    if len(segments_text(segs)) < max(200, int(0.25 * len(raw_text))):
+        segs = raw_segs
+    text = segments_text(segs)
 
     mentions = find_mentions(upload.video_id, segs, universe)
     picks = extract_picks(upload.video_id, segs, universe)
@@ -548,12 +724,15 @@ def analyze_video(upload: Upload, segments: Optional[List[Segment]], universe: S
     }
 
     conviction = {sym: score_conviction(text, cnt) for sym, cnt in tickers.items()}
+    analysis_points = extract_analysis_points(segs, universe)
     return VideoAnalysis(
         upload=upload, has_transcript=has_tx, text=text,
         sentiment=sentiment, sentiment_score=sscore, tickers=tickers,
         mentions=mentions, picks=picks, events=events,
-        flags=scan_flags(text), digest=_digest(text, upload, summarizer),
+        flags=scan_flags(text),
+        digest=_digest(text, upload, summarizer, analysis_points=analysis_points),
         conviction=conviction, ticker_sentiment=ticker_sentiment,
+        analysis_points=analysis_points,
     )
 
 

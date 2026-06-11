@@ -43,6 +43,9 @@ from swingtradeapp import insiders as ins
 from swingtradeapp.universe import PreMarketScanner, UniverseFilter
 from swingtradeapp.watchlist import WatchlistManager
 from swingtradeapp.whale import WhaleConfig, WhaleDetector
+from swingtradeapp.momentum_radar import RallyConfig, RallyDetector
+from swingtradeapp import ml_signal
+from swingtradeapp.ml_signal import MLSignalModel
 
 # ── Cached singletons ──────────────────────────────────────────────────────────
 
@@ -151,10 +154,14 @@ def fetch_symbol_info(symbol: str) -> Dict:
             "price": price,
             "change_pct": change,
             "market_cap": info.get("marketCap"),
+            "name": info.get("longName") or info.get("shortName") or symbol,
+            "summary": info.get("longBusinessSummary") or "",
+            "website": info.get("website") or "",
         }
     except Exception:
         return {"sector": "Unknown", "industry": "Unknown", "price": None,
-                "change_pct": None, "market_cap": None}
+                "change_pct": None, "market_cap": None,
+                "name": symbol, "summary": "", "website": ""}
 
 
 @st.cache_data(ttl=600)
@@ -317,11 +324,13 @@ def analyze_options(symbol: str) -> Dict:
     oa = get_options_analyzer()
     current_iv = oa.fetch_current_iv(symbol)
     earn = oa.fetch_earnings_date(symbol)
+    spot = fetch_symbol_info(symbol).get("price")
     return {
         "iv_rank": oa.fetch_iv_rank(symbol),
         "current_iv": current_iv,
         "pc_ratio": oa.fetch_put_call_ratio_symbol(symbol),
         "unusual": oa.detect_unusual_volume(symbol),
+        "key_strikes": oa.analyze_key_strikes(symbol, spot=spot),
         "earnings_date": earn,
         "iv_crush": oa.estimate_iv_crush(symbol, current_iv) if current_iv else None,
     }
@@ -455,6 +464,19 @@ def _reco_color(v: str) -> str:
     return "color:#888888"
 
 
+def _ml_prob_color(v) -> str:
+    """Cell color for the ML P(up): green ≥0.55, red ≤0.45, neutral between (dataframe styler)."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if f >= 0.55:
+        return "color:#00c851;font-weight:bold"
+    if f <= 0.45:
+        return "color:#ff4444"
+    return "color:#888888"
+
+
 def _hl_pct(v) -> str:
     """Green/red text color for a signed numeric percentage (dataframe styler)."""
     try:
@@ -482,6 +504,7 @@ def _limit_note(entry, current) -> str:
 # Best ET window to run each scanning screen, so you don't have to run them all every time.
 RECOMMENDED_TIMES: Dict[str, str] = {
     "Screener": "After 9:45 AM ET (let the open settle) — or after the close to plan tomorrow",
+    "Rally Radar": "After the close (completed daily bars) — or 9:45 AM+ once the open settles",
     "Signal Stack": "After the close, or 9:45 AM+ once the open settles",
     "ETF Screener": "After the close (daily bars) — or anytime",
     "Pre-Market Movers": "8:00–9:15 AM ET (after the 8:30 econ data)",
@@ -644,6 +667,37 @@ def scan_whale_activity(sample_size: int = 120, min_rvol: float = 2.0,
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.sort_values("whale_score", ascending=False).reset_index(drop=True)
+    return df
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def scan_rally_radar(sample_size: int = 150, min_score: float = 45.0) -> pd.DataFrame:
+    """Scan the most-active universe for *early* / pre-breakout bullish setups (cached 10 min).
+
+    Unlike the Screener (which rewards already-established trends), the RallyDetector looks for
+    momentum *igniting*: a volatility squeeze, volume starting to build, a MACD/RSI inflection,
+    a 20-day-MA reclaim, and price pressing the top of its base — scored 0–100 with a stage label
+    (Coiling → Igniting → Breaking out). Most-active names are scanned first.
+    """
+    detector = RallyDetector(RallyConfig())
+    universe = get_screen_universe()[:sample_size]
+    records: List[Dict] = []
+    for sym in universe:
+        hist = fetch_symbol_history(sym, days=160)
+        if hist.empty or len(hist) < 60 or "Volume" not in hist.columns:
+            continue
+        closes = _to_series(hist, "Close")
+        records.append({
+            "symbol": sym,
+            "closes": closes,
+            "volumes": _to_series(hist, "Volume"),
+            "highs": _to_series(hist, "High") if "High" in hist.columns else closes,
+            "lows": _to_series(hist, "Low") if "Low" in hist.columns else closes,
+        })
+    rows = detector.scan(records, min_score=min_score)
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("rally_score", ascending=False).reset_index(drop=True)
     return df
 
 
@@ -1171,6 +1225,45 @@ def calibrate_kelly_priors(_config, sample_size: int = 30) -> Optional[Dict]:
     }
 
 
+ML_MODEL_PATH = Path(".data") / "ml_signal_model.joblib"
+
+
+@st.cache_resource(show_spinner="Training ML signal model (one-time)…")
+def get_ml_signal_model(sample_size: int = 40):
+    """Walk-forward-trained, calibrated P(up) model (the Screener's optional ML score).
+
+    Loaded from ``.data/ml_signal_model.joblib`` when present; otherwise trained once from a
+    universe sample, cached to disk (cross-session) and to the resource cache (in-session).
+    Returns ``None`` if scikit-learn or sufficient data is unavailable, so the app falls back to
+    the rule-based score. Trained out-of-sample (see ``MLSignalModel.train``).
+    """
+    cached = MLSignalModel.load(ML_MODEL_PATH)
+    if cached is not None and cached.trained:
+        return cached
+    try:
+        histories = []
+        for sym in get_screen_universe()[:sample_size]:
+            hist = fetch_symbol_history(sym, days=400)
+            if hist.empty or len(hist) < 80 or "Volume" not in hist.columns:
+                continue
+            closes = _to_series(hist, "Close")
+            histories.append({
+                "symbol": sym, "closes": closes,
+                "highs": _to_series(hist, "High") if "High" in hist.columns else closes,
+                "lows": _to_series(hist, "Low") if "Low" in hist.columns else closes,
+                "volumes": _to_series(hist, "Volume"),
+            })
+        X, y, times = ml_signal.build_dataset(histories)
+        model = MLSignalModel()
+        if not model.train(X, y, times) or not model.trained:
+            return None
+        Path(".data").mkdir(exist_ok=True)
+        model.save(ML_MODEL_PATH)
+        return model
+    except Exception:
+        return None
+
+
 # ── Signal table ───────────────────────────────────────────────────────────────
 
 def build_signal_table(
@@ -1181,6 +1274,7 @@ def build_signal_table(
     account_size: float,
     filters: Dict,
     include_backtest: bool = False,
+    ml_model=None,
 ) -> pd.DataFrame:
     trend_generator = get_signal_generator(config)
     position_sizer = get_sizer(config)
@@ -1225,7 +1319,15 @@ def build_signal_table(
             bt = run_symbol_backtest(symbol, config, days=120) if include_backtest else None
 
             sentiment = aggregate_news_sentiment(symbol, analyzer)
-            position_size = position_sizer.size_position(signal, account_size=account_size)
+
+            # Optional ML probability of an up move over the swing horizon (calibrated, OOS-trained).
+            ml_prob = None
+            if ml_model is not None:
+                ml_prob = ml_model.predict_proba(
+                    ml_signal.extract_features(closes, highs, lows, volumes))
+
+            position_size = position_sizer.size_position(
+                signal, account_size=account_size, win_prob=ml_prob)
             allocation = float(position_size.fraction) * 100 * allocation_scale
 
             # Risk-reward ratio
@@ -1239,6 +1341,7 @@ def build_signal_table(
                 "change_pct": info.get("change_pct"),
                 "recommendation": recommend_label(signal.score, signal.signal_type),
                 "score": signal.score,
+                "ml_prob": ml_prob,
                 "rsi": signal.metadata.get("rsi"),
                 "macd_hist": signal.metadata.get("macd_hist"),
                 "atr": signal.metadata.get("atr"),
@@ -1638,9 +1741,15 @@ def run_dashboard() -> None:
         else:
             st.caption("Sizer using default priors (insufficient out-of-sample trades to calibrate).")
 
+        ml_model = get_ml_signal_model() if _ai_on("ai_ml_signal") else None
+        if _ai_on("ai_ml_signal") and ml_model is None:
+            st.caption("ℹ️ ML signal model unavailable (training needs more data, or scikit-learn "
+                       "is missing) — using the rule-based score only.")
+
         with st.spinner(f"Scanning {len(scan_universe)} symbols…"):
             df = build_signal_table(scan_universe, config, min_score, allocation_scale,
-                                    account_size, filters, include_backtest=include_bt)
+                                    account_size, filters, include_backtest=include_bt,
+                                    ml_model=ml_model)
 
         if df.empty:
             st.warning("No signals passed filters. Lower the min score or expand the universe.")
@@ -1653,14 +1762,38 @@ def run_dashboard() -> None:
             m4.metric("Avg R:R", f"{df['risk_reward'].mean():.1f}x")
             m5.metric("Avg Sentiment", f"{df['sentiment_pct'].mean():.2f}%")
 
+            # Company info on hover — a strip of ticker pills above the table. Reuses the cached
+            # fetch_symbol_info the scan already populated (cache hit, no extra network calls).
+            _top = df.sort_values("score", ascending=False).head(40)
+            _profiles = []
+            for _, _r in _top.iterrows():
+                _info = fetch_symbol_info(_r["symbol"])
+                _profiles.append({
+                    "symbol": _r["symbol"],
+                    "name": _info.get("name"),
+                    "sector": _r.get("sector") or _info.get("sector"),
+                    "industry": _info.get("industry"),
+                    "market_cap": _r.get("market_cap") or _info.get("market_cap"),
+                    "change_pct": _r.get("change_pct"),
+                    "summary": _info.get("summary"),
+                })
+            st.caption("💡 Hover a ticker for company info")
+            ui.render_ticker_hovercards(_profiles)
+
             # Display table
-            disp_cols = ["symbol", "price", "change_pct", "recommendation", "score", "rsi",
-                         "macd_hist", "vol_surge", "entry", "stop", "target", "risk_reward",
-                         "allocation_pct", "allocation_usd", "sentiment_pct", "sector"]
+            has_ml = "ml_prob" in df.columns and df["ml_prob"].notna().any()
+            disp_cols = ["symbol", "price", "change_pct", "recommendation", "score"]
+            if has_ml:
+                disp_cols.append("ml_prob")
+            disp_cols += ["rsi", "macd_hist", "vol_surge", "entry", "stop", "target",
+                          "risk_reward", "allocation_pct", "allocation_usd", "sentiment_pct",
+                          "sector"]
             if include_bt:
                 disp_cols += ["bt_win_rate", "bt_profit_factor", "bt_sharpe"]
 
             disp = df[disp_cols].sort_values("score", ascending=False).copy()
+            if has_ml:
+                disp = disp.rename(columns={"ml_prob": "ML P(up)"})
 
             fmt = {
                 "price": "${:.2f}", "change_pct": "{:.2f}%", "score": "{:.2f}",
@@ -1669,13 +1802,23 @@ def run_dashboard() -> None:
                 "risk_reward": "{:.2f}x", "allocation_pct": "{:.2f}%",
                 "allocation_usd": "${:,.0f}", "sentiment_pct": "{:.2f}%",
             }
+            if has_ml:
+                fmt["ML P(up)"] = "{:.0%}"
             if include_bt:
                 fmt.update({"bt_win_rate": "{:.2%}", "bt_profit_factor": "{:.2f}", "bt_sharpe": "{:.2f}"})
 
-            st.dataframe(
-                disp.style.format(fmt, na_rep="—").map(_reco_color, subset=["recommendation"]),
-                use_container_width=True, height=420,
-            )
+            styler = disp.style.format(fmt, na_rep="—").map(_reco_color, subset=["recommendation"])
+            if has_ml:
+                styler = styler.map(_ml_prob_color, subset=["ML P(up)"])
+
+            st.dataframe(styler, use_container_width=True, height=420)
+            if has_ml:
+                _m = (get_ml_signal_model() or MLSignalModel()).metrics
+                if _m:
+                    st.caption(f"🤖 **ML P(up)** = calibrated, walk-forward-trained probability of an "
+                               f"up move over ~{(get_ml_signal_model().horizon)} sessions "
+                               f"(OOS AUC {_m.get('auc', float('nan')):.2f}, "
+                               f"Brier {_m.get('brier', float('nan')):.2f}). It also drives Kelly sizing.")
 
             # Export
             st.download_button(
@@ -1734,6 +1877,99 @@ def run_dashboard() -> None:
         st.subheader("📰 Overall market news")
         with st.spinner("Loading market news…"):
             render_market_news(config)
+
+    # ═══════════════════════ RALLY RADAR (EARLY MOMENTUM) ════════════════════
+    elif page == "Rally Radar":
+        st.header("🚀 Rally Radar")
+        st.caption("Stocks whose momentum is *igniting* — about to start a move, not ones that "
+                   "already ran. Looks for the pre-breakout setup: a volatility squeeze, volume "
+                   "starting to build, a MACD/RSI turn, a 20-day-MA reclaim, and price pressing "
+                   "the top of its base. Each gets a 0–100 **Rally Readiness** score and a stage: "
+                   "**Coiling** → **Igniting** → **Breaking out**.")
+
+        rr1, rr2, rr3 = st.columns(3)
+        with rr1:
+            rr_n = st.slider("Universe size", 40, 250, 150, 10,
+                             help="Most-active names are scanned first")
+        with rr2:
+            rr_min = st.slider("Min Rally Readiness", 30, 80, 45, 5,
+                               help="Higher = only the strongest setups")
+        with rr3:
+            rr_stage = st.selectbox("Stage", ["All", "Coiling", "Igniting", "Breaking out"],
+                                    help="Coiling = earliest (still quiet); Breaking out = latest")
+
+        if not scan_gate("rallyradar", RECOMMENDED_TIMES["Rally Radar"], clear=scan_rally_radar.clear):
+            st.stop()
+        with st.spinner("Scanning for igniting momentum…"):
+            rally = scan_rally_radar(sample_size=rr_n, min_score=float(rr_min))
+
+        if rally.empty:
+            st.info("No early-momentum setups cleared the bar right now. Lower the minimum score "
+                    "or widen the universe — quiet tapes simply have fewer coiled springs.")
+        else:
+            view = rally if rr_stage == "All" else rally[rally["stage"] == rr_stage]
+            if view.empty:
+                st.info(f"No '{rr_stage}' setups right now — try another stage or 'All'.")
+            else:
+                rm1, rm2, rm3, rm4 = st.columns(4)
+                rm1.metric("Setups", len(view))
+                rm2.metric("Coiling", int((rally["stage"] == "Coiling").sum()))
+                rm3.metric("Igniting", int((rally["stage"] == "Igniting").sum()))
+                rm4.metric("Breaking out", int((rally["stage"] == "Breaking out").sum()))
+
+                disp = view.rename(columns={
+                    "symbol": "Symbol", "rally_score": "Readiness", "stage": "Stage",
+                    "price": "Price", "change_pct": "Change %", "rsi": "RSI",
+                    "rvol5": "Rel Vol", "bb_pctile": "Squeeze %ile",
+                    "dist_to_high_pct": "% to High", "reasons": "Why",
+                })[["Symbol", "Readiness", "Stage", "Price", "Change %", "RSI", "Rel Vol",
+                    "Squeeze %ile", "% to High", "Why"]]
+
+                def _stage_color(v: str) -> str:
+                    return {"Breaking out": "color:#00c851;font-weight:bold",
+                            "Igniting": "color:#00a843;font-weight:bold",
+                            "Coiling": "color:#0b6cad"}.get(v, "color:#888888")
+
+                def _chg_color(v):
+                    if v is None or (isinstance(v, float) and pd.isna(v)):
+                        return ""
+                    return "color:#00c851" if v > 0 else ("color:#ff4444" if v < 0 else "")
+
+                st.dataframe(
+                    disp.style.format({
+                        "Readiness": "{:.1f}", "Price": "${:.2f}", "Change %": "{:+.2f}%",
+                        "RSI": "{:.0f}", "Rel Vol": "{:.2f}x", "Squeeze %ile": "{:.0f}",
+                        "% to High": "{:.2f}%",
+                    }, na_rep="—")
+                    .map(_stage_color, subset=["Stage"])
+                    .map(_chg_color, subset=["Change %"]),
+                    use_container_width=True, height=520,
+                )
+
+                st.download_button(
+                    "Download CSV", view.to_csv(index=False),
+                    file_name=f"rally_radar_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv",
+                )
+
+                with st.expander("How to read Rally Radar"):
+                    st.markdown(
+                        "- **Readiness (0–100)** — how many early-rally signals are lining up "
+                        "(squeeze + volume + MACD/RSI turn + MA reclaim + base breakout).\n"
+                        "- **Stage** — **Coiling** (tight, quiet base, hasn't moved yet — earliest "
+                        "and least confirmed) → **Igniting** (momentum turning up, volume building) "
+                        "→ **Breaking out** (pressing the recent high with volume).\n"
+                        "- **Squeeze %ile** — where today's Bollinger-band *width* sits vs its own "
+                        "recent range. **Low = tightly coiled** (a quiet base that tends to precede "
+                        "an expansion move).\n"
+                        "- **Rel Vol** — last 5 days' volume ÷ the 20-day average (>1 = building).\n"
+                        "- **% to High** — distance below the 20-day high (small = pressing "
+                        "resistance / about to break out).\n"
+                        "- **Why** — the specific signals that fired for that name.\n\n"
+                        "These are *early* setups — higher reward but less confirmed than the "
+                        "Screener's established trends. Pair with the Screener and your own "
+                        "risk plan; this is not advice."
+                    )
 
     # ═══════════════════════ PRE-MARKET MOVERS ═══════════════════════════════
     elif page == "Pre-Market Movers":
@@ -2093,6 +2329,78 @@ def run_dashboard() -> None:
                                f"est. IV crush ≈ {crush['iv_crush_pct']:.0f}% post-earnings")
                 elif od["earnings_date"]:
                     st.caption(f"Next earnings: {od['earnings_date']:%Y-%m-%d}")
+
+            # ── Key strikes & positioning (the "what does this mean" analytics) ──
+            ks = od.get("key_strikes")
+            if ks:
+                st.markdown("#### 📍 Key strikes & positioning")
+                spot = ks.get("spot")
+                pw, cw, mp = ks.get("put_wall"), ks.get("call_wall"), ks.get("max_pain")
+                k1, k2, k3, k4 = st.columns(4)
+                with k1:
+                    if pw:
+                        st.metric("Put OI wall", f"${pw['strike']:.2f}",
+                                  help="Strike with the most put open interest — often acts as "
+                                       "support (put sellers defend it).")
+                        tag = " · support" if (spot and pw["strike"] <= spot) else ""
+                        st.caption(f"{pw['oi']:,} OI{tag}")
+                    else:
+                        st.metric("Put OI wall", "—")
+                with k2:
+                    if cw:
+                        st.metric("Call OI wall", f"${cw['strike']:.2f}",
+                                  help="Strike with the most call open interest — often acts as "
+                                       "resistance.")
+                        tag = " · resistance" if (spot and cw["strike"] >= spot) else ""
+                        st.caption(f"{cw['oi']:,} OI{tag}")
+                    else:
+                        st.metric("Call OI wall", "—")
+                with k3:
+                    if mp is not None:
+                        st.metric("Max pain", f"${mp:.2f}",
+                                  help="Strike where the most option value expires worthless; "
+                                       "price often gravitates here into expiration.")
+                        if spot:
+                            st.caption(f"{(mp - spot) / spot * 100:+.2f}% vs spot")
+                    else:
+                        st.metric("Max pain", "—")
+                with k4:
+                    pcoi = ks.get("pc_oi_ratio")
+                    st.metric("Put/Call OI", f"{pcoi:.2f}" if pcoi is not None else "—",
+                              help="Total put ÷ call open interest. >1 = more puts open (defensive "
+                                   "/ bearish positioning); <1 = call-heavy.")
+                    st.caption(f"{ks.get('total_put_oi', 0):,}P / {ks.get('total_call_oi', 0):,}C")
+
+                # OI-by-strike around spot — the visual answer to "which strikes hold the puts?"
+                oi_rows = ks.get("oi_by_strike") or []
+                if oi_rows and spot:
+                    lo, hi = spot * 0.8, spot * 1.2
+                    near = [r for r in oi_rows if lo <= r["strike"] <= hi
+                            and (r["call_oi"] or r["put_oi"])]
+                    if near:
+                        odf = pd.DataFrame(near)
+                        ofig = go.Figure()
+                        ofig.add_bar(x=odf["strike"], y=odf["call_oi"], name="Call OI",
+                                     marker_color="#00c851")
+                        ofig.add_bar(x=odf["strike"], y=odf["put_oi"], name="Put OI",
+                                     marker_color="#ff4444")
+                        ofig.add_vline(x=spot, line_dash="dot", line_color="#888",
+                                       annotation_text="Spot")
+                        ofig.update_layout(
+                            barmode="group", height=300,
+                            margin=dict(t=30, l=10, r=10, b=10),
+                            xaxis_title="Strike", yaxis_title="Open interest",
+                            legend=dict(orientation="h", y=1.12, x=0),
+                        )
+                        st.plotly_chart(ofig, use_container_width=True,
+                                        key=f"oi_strikes_{opt_sym}")
+                st.caption(f"Nearest expiration: {ks.get('expiration', '—')}. Open-interest "
+                           "concentrations and max pain are positioning context, not a forecast.")
+            else:
+                st.markdown("#### 📍 Key strikes & positioning")
+                st.info("Options positioning unavailable for this symbol right now — it may have "
+                        "no listed options, an illiquid/empty chain, or the feed is throttling "
+                        "(try again in a moment).")
 
             unusual = od["unusual"]
             if unusual and (unusual.get("unusual_calls") or unusual.get("unusual_puts")):
@@ -3177,6 +3485,10 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
                     st.markdown(f"[▶ Open video]({up.url})")
                     if a.digest:
                         st.markdown(f"**Digest:** {a.digest}")
+                    if a.analysis_points:
+                        st.markdown("**Key analysis points:**")
+                        for pt in a.analysis_points:
+                            st.markdown(f"- {pt}")
                     if a.mentions:
                         st.markdown("**Mentions** (jump to the moment):")
                         for mn in a.mentions[:10]:
@@ -3371,6 +3683,34 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
                 help="Dedup recycled headlines via sentence-transformers")
         st.caption("Forecast appears on Auto Watchlist + Screener drill-down; news AI on the "
                    "Screener drill-down.")
+
+        st.markdown("**ML signal model** — uses scikit-learn (already installed; no extra download)")
+        st.session_state["ai_ml_signal"] = st.checkbox(
+            "Add ML P(up) to the Screener + drive Kelly sizing", value=_ai_on("ai_ml_signal"),
+            help="A calibrated, walk-forward-trained probability of an up move over the swing "
+                 "horizon, learned from the same technical features the Screener uses.")
+        if _ai_on("ai_ml_signal"):
+            _mlm = get_ml_signal_model()
+            if _mlm is not None and _mlm.metrics:
+                mm = _mlm.metrics
+                ms1, ms2, ms3 = st.columns(3)
+                ms1.metric("OOS AUC", f"{mm.get('auc', float('nan')):.3f}")
+                ms2.metric("OOS accuracy", f"{mm.get('accuracy', float('nan')):.2%}")
+                ms3.metric("Brier (lower=better)", f"{mm.get('brier', float('nan')):.3f}")
+                st.caption(f"Trained on {mm.get('n_train', 0):,} samples · validated on "
+                           f"{mm.get('n_val', 0):,} (held-out, base rate "
+                           f"{mm.get('base_rate', float('nan')):.0%}) · horizon ~{_mlm.horizon} "
+                           "sessions. AUC just above 0.50 is normal for noisy daily data.")
+            else:
+                st.caption("Model not trained yet — it builds on the next Screener scan "
+                           "(or scikit-learn/data is unavailable).")
+            if st.button("Retrain ML model"):
+                try:
+                    ML_MODEL_PATH.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                get_ml_signal_model.clear()
+                st.success("Cleared — the model retrains on the next Screener scan.")
 
         st.subheader("Cache Management")
         if st.button("Clear all caches"):

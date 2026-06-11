@@ -240,6 +240,89 @@ class OptionsAnalyzer:
         except Exception:
             return None
 
+    def analyze_key_strikes(
+        self,
+        symbol: str,
+        spot: Optional[float] = None,
+    ) -> Optional[Dict[str, any]]:
+        """Open-interest 'walls', max-pain, and OI put/call ratio for the nearest expiration.
+
+        Answers *where* the options positioning sits — the put-OI wall (the strike with the most
+        put open interest) often acts as **support** (sellers of those puts defend it), the call-OI
+        wall as **resistance**, and **max pain** is the strike where the most option value expires
+        worthless, which price often gravitates toward into expiration. Best-effort and None-safe.
+        """
+        try:
+            ticker = yf.Ticker(symbol)
+            dates = ticker.options
+            if not dates:
+                return None
+            expiration = dates[0]
+            chain = ticker.option_chain(expiration)
+            calls, puts = chain.calls.copy(), chain.puts.copy()
+            if calls.empty and puts.empty:
+                return None
+
+            for df in (calls, puts):
+                for col in ("openInterest", "volume", "strike"):
+                    if col in df.columns:
+                        df[col] = df[col].fillna(0)
+
+            if spot is None:
+                try:
+                    spot = float(ticker.fast_info["lastPrice"])
+                except Exception:
+                    spot = None
+
+            call_oi = {float(r.strike): float(r.openInterest) for r in calls.itertuples()}
+            put_oi = {float(r.strike): float(r.openInterest) for r in puts.itertuples()}
+            strikes = sorted(set(call_oi) | set(put_oi))
+
+            def _wall(df):
+                if df.empty or df["openInterest"].max() <= 0:
+                    return None
+                row = df.loc[df["openInterest"].idxmax()]
+                return {"strike": float(row["strike"]), "oi": int(row["openInterest"]),
+                        "volume": int(row["volume"])}
+
+            call_wall = _wall(calls)
+            put_wall = _wall(puts)
+
+            # Max pain: the strike that minimizes total intrinsic value paid to option holders
+            # (calls below it + puts above it). Small chains, so the O(n²) sweep is cheap.
+            def _pain(K: float) -> float:
+                tot = 0.0
+                for s, oi in call_oi.items():
+                    if K > s:
+                        tot += (K - s) * oi
+                for s, oi in put_oi.items():
+                    if K < s:
+                        tot += (s - K) * oi
+                return tot
+
+            max_pain = min(strikes, key=_pain) if strikes else None
+
+            total_call_oi = sum(call_oi.values())
+            total_put_oi = sum(put_oi.values())
+            pc_oi_ratio = (total_put_oi / total_call_oi) if total_call_oi else None
+
+            return {
+                "expiration": expiration,
+                "spot": spot,
+                "max_pain": max_pain,
+                "call_wall": call_wall,
+                "put_wall": put_wall,
+                "pc_oi_ratio": pc_oi_ratio,
+                "total_call_oi": int(total_call_oi),
+                "total_put_oi": int(total_put_oi),
+                "oi_by_strike": [
+                    {"strike": s, "call_oi": call_oi.get(s, 0.0), "put_oi": put_oi.get(s, 0.0)}
+                    for s in strikes
+                ],
+            }
+        except Exception:
+            return None
+
     # ── Earnings IV Crush Prediction ───────────────────────────────────────────
 
     def fetch_earnings_date(self, symbol: str) -> Optional[datetime]:

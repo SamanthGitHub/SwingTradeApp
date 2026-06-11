@@ -10,7 +10,8 @@ styled ``st.radio`` when it isn't (same fallback philosophy as the optional AI f
 app never crashes if the dependency hasn't been installed into the venv yet.
 """
 
-from typing import List, Tuple
+import html
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import streamlit as st
 
@@ -27,6 +28,7 @@ ACCENT_DARK = "#00a843"
 NAV_ITEMS: List[Tuple[str, str, str]] = [
     # Find ideas
     ("Screener", "graph-up", "📈"),
+    ("Rally Radar", "rocket-takeoff", "🚀"),  # early / pre-breakout momentum-ignition setups
     ("Signal Stack", "layers", "🧩"),  # synthesis of the other screens
     ("ETF Screener", "grid-3x3-gap", "🗂️"),
     ("Auto Watchlist", "stars", "⭐"),
@@ -182,6 +184,40 @@ footer {{visibility: hidden;}}
 .metric-positive {{color: {ACCENT}; font-weight: bold;}}
 .metric-negative {{color: #ff4444; font-weight: bold;}}
 
+/* ── Ticker hover cards: a strip of pills that reveal a company info card on hover ──
+   Pure CSS (no JS); theme-aware via Streamlit vars; pills are focusable so the card also
+   shows on keyboard focus / tap (touch devices have no hover). */
+.tk-hovers {{ display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.1rem 0 0.7rem; }}
+.tk-pill {{
+    position: relative; display: inline-flex; align-items: center; gap: 0.35rem;
+    padding: 0.2rem 0.62rem; border-radius: 999px; cursor: default;
+    font-weight: 700; font-size: 0.82rem; line-height: 1.4;
+    background: var(--secondary-background-color); border: 1px solid rgba(128,128,128,.22);
+    transition: border-color .12s ease, box-shadow .12s ease;
+}}
+.tk-pill:hover, .tk-pill:focus {{
+    border-color: rgba(0,200,81,.6); box-shadow: 0 3px 10px rgba(0,200,81,.18);
+    outline: none; z-index: 60;
+}}
+.tk-pill .tk-chg {{ font-size: 0.72rem; font-weight: 600; opacity: .9; }}
+.tk-chg-pos {{ color: {ACCENT}; }}
+.tk-chg-neg {{ color: #ff4444; }}
+.tk-card {{
+    position: absolute; left: 0; top: calc(100% + 8px); width: 280px; max-width: 78vw;
+    z-index: 1000; text-align: left; font-weight: 400; white-space: normal;
+    background: var(--background-color); color: var(--text-color);
+    border: 1px solid rgba(128,128,128,.28); border-radius: 0.7rem; padding: 0.7rem 0.8rem;
+    box-shadow: 0 12px 30px rgba(0,0,0,.22);
+    opacity: 0; visibility: hidden; transform: translateY(-4px); pointer-events: none;
+    transition: opacity .14s ease, transform .14s ease;
+}}
+.tk-pill:hover .tk-card, .tk-pill:focus .tk-card {{
+    opacity: 1; visibility: visible; transform: translateY(0);
+}}
+.tk-card .tk-name {{ font-weight: 700; font-size: 0.92rem; margin-bottom: 0.12rem; }}
+.tk-card .tk-meta {{ font-size: 0.73rem; opacity: .72; margin-bottom: 0.45rem; }}
+.tk-card .tk-sum {{ font-size: 0.78rem; line-height: 1.38; opacity: .92; }}
+
 /* ── Mobile / small-screen optimization ──────────────────────────────────────── */
 @media (max-width: 640px) {{
     /* reclaim horizontal space (Streamlit's default desktop padding is large) */
@@ -247,6 +283,74 @@ def render_header() -> None:
         '</div>',
         unsafe_allow_html=True,
     )
+
+
+def _fmt_market_cap(value: Optional[float]) -> str:
+    """Human-readable market cap (e.g. ``$1.2T`` / ``$840.0B`` / ``$95.0M``)."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if v <= 0:
+        return ""
+    for cutoff, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M")):
+        if v >= cutoff:
+            return f"${v / cutoff:.1f}{suffix}"
+    return f"${v:,.0f}"
+
+
+def render_ticker_hovercards(profiles: Sequence[Dict]) -> None:
+    """Render a strip of ticker pills, each revealing a company info card on hover/focus.
+
+    ``profiles`` is a sequence of dicts with keys: ``symbol`` (required) and optional
+    ``name``, ``sector``, ``industry``, ``market_cap``, ``change_pct``, ``summary``.
+    Pure HTML/CSS (styles live in ``_BRAND_CSS``); no JS, no extra network calls — the caller
+    passes data it already has. All text is HTML-escaped. Touch/keyboard users get the card on
+    focus since the pills are ``tabindex=0``.
+    """
+    pills: List[str] = []
+    for p in profiles:
+        symbol = str(p.get("symbol") or "").strip()
+        if not symbol:
+            continue
+        sym_e = html.escape(symbol)
+
+        chg = p.get("change_pct")
+        chg_html = ""
+        try:
+            if chg is not None:
+                cls = "tk-chg-pos" if float(chg) >= 0 else "tk-chg-neg"
+                chg_html = f'<span class="tk-chg {cls}">{float(chg):+.2f}%</span>'
+        except (TypeError, ValueError):
+            chg_html = ""
+
+        name = html.escape(str(p.get("name") or symbol))
+        meta_bits = [str(p.get("sector") or "").strip(), str(p.get("industry") or "").strip()]
+        meta_bits = [b for b in meta_bits if b and b.lower() != "unknown"]
+        mcap = _fmt_market_cap(p.get("market_cap"))
+        if mcap:
+            meta_bits.append(mcap)
+        meta = html.escape(" · ".join(meta_bits)) if meta_bits else "—"
+
+        summary = str(p.get("summary") or "").strip()
+        if len(summary) > 240:
+            summary = summary[:237].rstrip() + "…"
+        summary_html = (
+            f'<div class="tk-sum">{html.escape(summary)}</div>' if summary
+            else '<div class="tk-sum" style="opacity:.6">No company description available.</div>'
+        )
+
+        pills.append(
+            f'<span class="tk-pill" tabindex="0">{sym_e}{chg_html}'
+            f'<span class="tk-card">'
+            f'<div class="tk-name">{name}</div>'
+            f'<div class="tk-meta">{meta}</div>'
+            f'{summary_html}'
+            f'</span></span>'
+        )
+
+    if pills:
+        st.markdown(f'<div class="tk-hovers">{"".join(pills)}</div>', unsafe_allow_html=True)
 
 
 def render_nav() -> str:
