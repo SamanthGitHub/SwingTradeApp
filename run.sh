@@ -31,7 +31,12 @@ source "$VENV/bin/activate"
 
 # ── 3. Install/refresh deps only when requirements.txt changes ───────────────────
 python -m pip install --quiet --upgrade pip
-REQ_HASH="$(shasum requirements.txt | awk '{print $1}')"
+# shasum on macOS; sha1sum on most Linux distros.
+if command -v shasum >/dev/null 2>&1; then
+  REQ_HASH="$(shasum requirements.txt | awk '{print $1}')"
+else
+  REQ_HASH="$(sha1sum requirements.txt | awk '{print $1}')"
+fi
 STAMP="$VENV/.req-${REQ_HASH}"
 if [ ! -f "$STAMP" ]; then
   echo "⬇️  Installing dependencies (first run or requirements changed)…"
