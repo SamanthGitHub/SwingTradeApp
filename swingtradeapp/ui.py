@@ -202,13 +202,16 @@ footer {{visibility: hidden;}}
 .tk-pill .tk-chg {{ font-size: 0.72rem; font-weight: 600; opacity: .9; }}
 .tk-chg-pos {{ color: {ACCENT}; }}
 .tk-chg-neg {{ color: #ff4444; }}
+/* The card opens UPWARD (above the pill), over the metrics/caption — never into the table below.
+   Streamlit renders st.dataframe in its own canvas that paints over absolutely-positioned HTML
+   regardless of z-index, so opening downward got clipped/overlapped; opening up avoids it. */
 .tk-card {{
-    position: absolute; left: 0; top: calc(100% + 8px); width: 280px; max-width: 78vw;
+    position: absolute; left: 0; bottom: calc(100% + 8px); top: auto; width: 280px; max-width: 78vw;
     z-index: 1000; text-align: left; font-weight: 400; white-space: normal;
     background: var(--background-color); color: var(--text-color);
     border: 1px solid rgba(128,128,128,.28); border-radius: 0.7rem; padding: 0.7rem 0.8rem;
-    box-shadow: 0 12px 30px rgba(0,0,0,.22);
-    opacity: 0; visibility: hidden; transform: translateY(-4px); pointer-events: none;
+    box-shadow: 0 -8px 28px rgba(0,0,0,.24);
+    opacity: 0; visibility: hidden; transform: translateY(4px); pointer-events: none;
     transition: opacity .14s ease, transform .14s ease;
 }}
 .tk-pill:hover .tk-card, .tk-pill:focus .tk-card {{
