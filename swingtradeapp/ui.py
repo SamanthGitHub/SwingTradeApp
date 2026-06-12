@@ -187,9 +187,12 @@ footer {{visibility: hidden;}}
 /* ── Ticker hover cards: a strip of pills that reveal a company info card on hover ──
    Pure CSS (no JS); theme-aware via Streamlit vars; pills are focusable so the card also
    shows on keyboard focus / tap (touch devices have no hover). */
-.tk-hovers {{ display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.1rem 0 0.7rem; }}
+.tk-hovers {{
+    position: relative; z-index: 50;  /* lift the whole strip above the metric cards behind it */
+    display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.1rem 0 0.7rem;
+}}
 .tk-pill {{
-    position: relative; display: inline-flex; align-items: center; gap: 0.35rem;
+    position: relative; isolation: isolate; display: inline-flex; align-items: center; gap: 0.35rem;
     padding: 0.2rem 0.62rem; border-radius: 999px; cursor: default;
     font-weight: 700; font-size: 0.82rem; line-height: 1.4;
     background: var(--secondary-background-color); border: 1px solid rgba(128,128,128,.22);
@@ -197,22 +200,26 @@ footer {{visibility: hidden;}}
 }}
 .tk-pill:hover, .tk-pill:focus {{
     border-color: rgba(0,200,81,.6); box-shadow: 0 3px 10px rgba(0,200,81,.18);
-    outline: none; z-index: 60;
+    outline: none; z-index: 9999;
 }}
 .tk-pill .tk-chg {{ font-size: 0.72rem; font-weight: 600; opacity: .9; }}
 .tk-chg-pos {{ color: {ACCENT}; }}
 .tk-chg-neg {{ color: #ff4444; }}
-/* The card opens UPWARD (above the pill), over the metrics/caption — never into the table below.
-   Streamlit renders st.dataframe in its own canvas that paints over absolutely-positioned HTML
-   regardless of z-index, so opening downward got clipped/overlapped; opening up avoids it. */
+/* The card opens UPWARD (above the pill), over the metrics/caption — never into the table below
+   (Streamlit's st.dataframe canvas paints over absolutely-positioned HTML). It's a SOLID, opaque,
+   elevated popover so the caption/metric text behind it never shows through. Explicit per-scheme
+   backgrounds (not theme vars) guarantee opacity in both light and dark. */
 .tk-card {{
-    position: absolute; left: 0; bottom: calc(100% + 8px); top: auto; width: 280px; max-width: 78vw;
-    z-index: 1000; text-align: left; font-weight: 400; white-space: normal;
-    background: var(--background-color); color: var(--text-color);
-    border: 1px solid rgba(128,128,128,.28); border-radius: 0.7rem; padding: 0.7rem 0.8rem;
-    box-shadow: 0 -8px 28px rgba(0,0,0,.24);
-    opacity: 0; visibility: hidden; transform: translateY(4px); pointer-events: none;
+    position: absolute; left: 0; bottom: calc(100% + 10px); top: auto; width: 280px; max-width: 80vw;
+    z-index: 99999; text-align: left; font-weight: 400; white-space: normal;
+    background: #ffffff; color: #14161c;
+    border: 1px solid rgba(120,120,140,.45); border-radius: 0.7rem; padding: 0.7rem 0.85rem;
+    box-shadow: 0 14px 38px rgba(0,0,0,.32), 0 3px 10px rgba(0,0,0,.22);
+    opacity: 0; visibility: hidden; transform: translateY(6px); pointer-events: none;
     transition: opacity .14s ease, transform .14s ease;
+}}
+@media (prefers-color-scheme: dark) {{
+    .tk-card {{ background: #1c2230; color: #e8eaed; border-color: rgba(255,255,255,.18); }}
 }}
 .tk-pill:hover .tk-card, .tk-pill:focus .tk-card {{
     opacity: 1; visibility: visible; transform: translateY(0);
