@@ -538,6 +538,29 @@ def _analysis_score(sentence: str, universe: Set[str]) -> int:
     return score
 
 
+# Title-case the company names we know (longest first so multi-word names win) — makes lowercase
+# auto-caption text readable.
+_TIDY_NAME_PATTERNS = [
+    (re.compile(r"\b" + re.escape(name) + r"\b", re.I), name.title())
+    for name in sorted(NAME_TO_TICKER, key=len, reverse=True)
+]
+
+
+def _tidy(snippet: str) -> str:
+    """Make an auto-caption fragment readable: collapse whitespace, Title-case known company names,
+    uppercase ``$cashtags``, capitalize the first letter, and ensure terminal punctuation."""
+    s = re.sub(r"\s+", " ", (snippet or "")).strip()
+    if not s:
+        return s
+    for pat, title in _TIDY_NAME_PATTERNS:
+        s = pat.sub(title, s)
+    s = _CASHTAG_RE.sub(lambda m: "$" + m.group(1).upper(), s)
+    s = s[0].upper() + s[1:]
+    if s[-1] not in ".!?…":
+        s += "."
+    return s
+
+
 def extract_analysis_points(segments: List[Segment], universe: Set[str],
                             max_points: int = 5) -> List[str]:
     """The most analysis-dense sentences from (already promo-stripped) segments.
@@ -597,7 +620,8 @@ def extract_analysis_points(segments: List[Segment], universe: Set[str],
         if key in seen:
             continue
         seen.add(key)
-        scored.append((sc, idx, s if len(s) <= 200 else s[:197].rstrip() + "…"))
+        snip = s if len(s) <= 200 else s[:197].rstrip() + "…"
+        scored.append((sc, idx, _tidy(snip)))
     # Top-scoring first, then restore chronological order among the picks.
     top = sorted(scored, key=lambda t: t[0], reverse=True)[:max_points]
     top.sort(key=lambda t: t[1])
@@ -653,25 +677,57 @@ def _sentiment(text: str, analyzer) -> tuple:
     return ("bullish" if b > s else "bearish"), round(conf, 3)
 
 
-def _digest(text: str, upload: "Upload", summarizer,
-            analysis_points: Optional[List[str]] = None) -> str:
-    """Short summary built from the **promo-stripped** text. Uses the local summarizer when
-    available, else falls back to the extracted analysis points (so the digest stays analysis-only
-    even without the optional AI model)."""
+def _digest_lead(sentiment: str, tickers: Optional[Counter], picks: Optional[List["Pick"]]) -> str:
+    """At-a-glance stance + extracted calls, derived from structured data (so it's accurate and
+    readable even when the transcript is messy lowercase auto-captions)."""
+    stance = {"bullish": "Bullish lean", "bearish": "Bearish lean"}.get(sentiment, "Mixed tone")
+    top = [sym for sym, _ in tickers.most_common(4)] if tickers else []
+    lead = stance + (" on " + ", ".join(top) if top else "")
+    lead = lead.rstrip(".") + "."
+
+    calls: List[str] = []
+    seen: Set[str] = set()
+    for p in (picks or []):
+        d = (p.direction or "").strip().lower()
+        if not d:
+            continue
+        label = {"buy": "Buy", "sell": "Sell", "hold": "Hold"}.get(d, d.title())
+        tgt = f" →${p.price_target:g}" if p.price_target else ""
+        entry = f"{label} {p.ticker}{tgt}"
+        if entry not in seen:
+            seen.add(entry)
+            calls.append(entry)
+    if calls:
+        lead += " Calls: " + ", ".join(calls[:4]) + "."
+    return lead
+
+
+def _digest(text: str, upload: "Upload", summarizer, *,
+            analysis_points: Optional[List[str]] = None, sentiment: str = "neutral",
+            tickers: Optional[Counter] = None, picks: Optional[List["Pick"]] = None) -> str:
+    """Readable per-video digest: a structured **lead** (stance + tickers + extracted calls) plus a
+    **body** — the local summarizer's prose when available, else the (already-tidied) top analysis
+    points, else the first couple of cleaned sentences. Built from promo-stripped text; no paid LLM.
+    """
+    lead = _digest_lead(sentiment, tickers, picks)
+
+    body = ""
     if summarizer is not None and text:
         try:
             chunks = [text[i:i + 1000] for i in range(0, min(len(text), 3000), 1000)]
             parts = [summarizer.summarize([c]) for c in chunks if c.strip()]
-            d = " ".join(p for p in parts if p).strip()
-            if d:
-                return d[:600]
+            body = " ".join(p for p in parts if p).strip()
         except Exception:
-            pass
-    if analysis_points:
-        return " ".join(analysis_points[:3])[:400]
-    base = text or upload.description
-    sents = re.split(r"(?<=[.!?])\s+", base.strip())
-    return " ".join(sents[:2])[:400]
+            body = ""
+    if not body and analysis_points:
+        body = analysis_points[0]  # already tidied; the full list shows under "Key analysis points"
+    if not body:
+        base = (text or upload.description or "").strip()
+        sents = [s for s in re.split(r"(?<=[.!?])\s+", base) if s.strip()]
+        body = " ".join(_tidy(s) for s in sents[:2])
+
+    digest = (lead + (" " + body if body else "")).strip()
+    return digest[:520]
 
 
 @dataclass
@@ -745,7 +801,8 @@ def analyze_video(upload: Upload, segments: Optional[List[Segment]], universe: S
         sentiment=sentiment, sentiment_score=sscore, tickers=tickers,
         mentions=mentions, picks=picks, events=events,
         flags=scan_flags(text),
-        digest=_digest(text, upload, summarizer, analysis_points=analysis_points),
+        digest=_digest(text, upload, summarizer, analysis_points=analysis_points,
+                       sentiment=sentiment, tickers=tickers, picks=picks),
         conviction=conviction, ticker_sentiment=ticker_sentiment,
         analysis_points=analysis_points,
     )
