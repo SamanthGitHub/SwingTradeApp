@@ -11,6 +11,7 @@ app never crashes if the dependency hasn't been installed into the venv yet.
 """
 
 import html
+import urllib.parse
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import streamlit as st
@@ -183,6 +184,24 @@ footer {{visibility: hidden;}}
 
 .metric-positive {{color: {ACCENT}; font-weight: bold;}}
 .metric-negative {{color: #ff4444; font-weight: bold;}}
+
+/* ── Sidebar nav as real anchor links (so right-click → "open in new tab" works and lands on
+   that screen via the ?page= URL param). Styled to match the old option-menu. ── */
+.stp-nav {{ display: flex; flex-direction: column; gap: 0.12rem; }}
+.stp-nav-link {{
+    display: flex; align-items: center; gap: 0.6rem;
+    padding: 0.5rem 0.75rem; border-radius: 0.5rem;
+    color: #8a93a3 !important; text-decoration: none !important;
+    font-size: 0.95rem; font-weight: 500; line-height: 1.2;
+    transition: background-color .12s ease, color .12s ease;
+}}
+.stp-nav-link:hover {{ background-color: rgba(0,200,81,.12); color: var(--text-color) !important; }}
+.stp-nav-link.active {{
+    background-color: {ACCENT}; color: #ffffff !important; font-weight: 600;
+    box-shadow: 0 3px 14px rgba(0,200,81,.45);
+}}
+.stp-nav-ico {{ width: 1.25rem; text-align: center; flex-shrink: 0; font-size: 1.0rem; }}
+.stp-nav-txt {{ white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
 
 /* ── Ticker hover cards: a strip of pills that reveal a company info card on hover ──
    Pure CSS (no JS); theme-aware via Streamlit vars; pills are focusable so the card also
@@ -363,59 +382,40 @@ def render_ticker_hovercards(profiles: Sequence[Dict]) -> None:
         st.markdown(f'<div class="tk-hovers">{"".join(pills)}</div>', unsafe_allow_html=True)
 
 
-def render_nav() -> str:
-    """Render the sidebar navigation and return the selected page label.
+def current_page() -> str:
+    """The active page from the ``?page=`` URL query param (defaults to the first nav item).
 
-    Prefers the icon-based ``streamlit-option-menu``; falls back to a styled ``st.radio`` (with
-    emoji-prefixed labels) when the package isn't installed, so the app keeps working either way.
-    The returned string always matches a ``NAV_ITEMS`` label / ``page ==`` branch in app.py.
+    Invalid/missing values fall back to the default so a hand-edited URL can't break routing.
     """
     labels = [item[0] for item in NAV_ITEMS]
     try:
-        from streamlit_option_menu import option_menu
-    except ImportError:
-        return _render_radio_fallback(labels)
+        raw = st.query_params.get("page")
+    except Exception:
+        raw = None
+    return raw if raw in labels else labels[0]
 
-    icons = [item[1] for item in NAV_ITEMS]
-    with st.sidebar:
-        # Theme-agnostic styles: transparent container, neutral unselected text (readable on both
-        # light and dark), primary-accent selection. Keeps "follow system" looking right.
-        return option_menu(
-            menu_title="Navigation",
-            options=labels,
-            icons=icons,
-            menu_icon="compass",
-            default_index=0,
-            styles={
-                "container": {"padding": "0.25rem 0", "background-color": "transparent"},
-                "icon": {"color": ACCENT, "font-size": "1.0rem"},
-                "nav-link": {
-                    "font-size": "0.95rem",
-                    "font-weight": "500",
-                    "color": "#8a93a3",
-                    "padding": "0.5rem 0.75rem",
-                    "margin": "0.12rem 0",
-                    "border-radius": "0.5rem",
-                    "--hover-color": "rgba(0, 200, 81, 0.12)",
-                },
-                "nav-link-selected": {
-                    "background-color": ACCENT,
-                    "color": "#ffffff",
-                    "font-weight": "600",
-                    "box-shadow": "0 3px 14px rgba(0, 200, 81, 0.45)",
-                },
-            },
+
+def render_nav() -> str:
+    """Render the sidebar nav as real anchor links and return the active page label.
+
+    The page is driven by the ``?page=`` query param, so every entry is a normal ``<a href>``:
+    left-click navigates this tab, and **right-click / ⌘-click / middle-click open it in a new
+    browser tab on that screen** — so you can work on several screens at once. The returned
+    string always matches a ``NAV_ITEMS`` label / ``page ==`` branch in app.py.
+    """
+    active = current_page()
+    links = []
+    for label, _icon, emoji in NAV_ITEMS:
+        href = "?page=" + urllib.parse.quote(label, safe="")
+        cls = "stp-nav-link active" if label == active else "stp-nav-link"
+        links.append(
+            f'<a class="{cls}" href="{href}" target="_self">'
+            f'<span class="stp-nav-ico">{emoji}</span>'
+            f'<span class="stp-nav-txt">{html.escape(label)}</span></a>'
         )
-
-
-def _render_radio_fallback(labels: List[str]) -> str:
-    """Styled ``st.radio`` nav used when ``streamlit-option-menu`` isn't installed."""
-    emoji = {item[0]: item[2] for item in NAV_ITEMS}
     with st.sidebar:
         st.markdown("#### Navigation")
-        return st.radio(
-            "Navigation",
-            labels,
-            format_func=lambda lbl: f"{emoji.get(lbl, '•')}  {lbl}",
-            label_visibility="collapsed",
-        )
+        st.markdown(f'<nav class="stp-nav" aria-label="Primary navigation">{"".join(links)}</nav>',
+                    unsafe_allow_html=True)
+        st.caption("💡 Right-click a screen → *Open in new tab* to work on several at once.")
+    return active
