@@ -51,6 +51,21 @@ TRADER_CHANNELS: Dict[str, str] = {
     "stevenfiorillo1": "Steven Fiorillo",
     "thehumblefarmer": "The Humble Farmer",
     "dr_crossroads": "Dr. Crossroads",
+    # Larger / higher-signal additions — big followings and a reputation for analysis over hype
+    # (education, valuation, value & growth stock breakdowns), so mentions are worth more weight.
+    # Wrong/renamed handles are auto-skipped (see resolve_channel_id), so a bad guess is harmless.
+    "LearntoInvest": "Learn to Invest",
+    "EverythingMoney": "Everything Money",
+    "TickerSymbolYOU": "Ticker Symbol: YOU",
+    "ThePlainBagel": "The Plain Bagel",
+    "PBoyle": "Patrick Boyle",
+    "BenFelixCSI": "Ben Felix",
+    "AswathDamodaranonValuation": "Aswath Damodaran",
+    "TheSwedishInvestor": "The Swedish Investor",
+    "HamishHodder": "Hamish Hodder",
+    "Parkev": "Parkev Tatevosian",
+    "Wealthion": "Wealthion",
+    "GeorgeGammon": "George Gammon",
 }
 
 _UA = {"User-Agent": "Mozilla/5.0 (SwingTradeApp YouTube scanner)"}

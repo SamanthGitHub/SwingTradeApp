@@ -3337,7 +3337,12 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
 
         yc1, yc2 = st.columns([1, 2])
         with yc1:
-            within_hours = st.slider("Lookback (hours)", 12, 48, 48, 6)
+            within_days = st.slider("Lookback (days)", 1, 30, 3, 1,
+                                    help="How many days back to scan each channel's uploads. "
+                                         "(YouTube's per-channel feed only carries the latest "
+                                         "~15 videos, so very active channels may not reach the "
+                                         "full window.)")
+            within_hours = within_days * 24.0
         with yc2:
             picked = st.multiselect("Channels", list(yt.TRADER_CHANNELS.values()),
                                     default=list(yt.TRADER_CHANNELS.values()))
@@ -3368,7 +3373,7 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
                 uploads += fetch_yt_uploads(cid, name, float(within_hours))
 
         uploads.sort(key=lambda u: u.published_ts, reverse=True)
-        uploads = uploads[:40]  # cap transcript fetches so the scan stays responsive
+        uploads = uploads[:60]  # cap transcript fetches so the scan stays responsive (newest first)
 
         if uploads:
             prog = st.progress(0.0, text="Reading transcripts…")
@@ -3386,7 +3391,7 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
 
         if not analyses:
             st.info("No uploads from the selected channels in the last "
-                    f"{within_hours}h. Widen the lookback or pick more channels.")
+                    f"{within_days} day(s). Widen the lookback or pick more channels.")
         else:
             # Persist any new extracted picks (idempotent), then grade the whole history.
             store = load_yt_store()
