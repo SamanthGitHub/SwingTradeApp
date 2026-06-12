@@ -561,8 +561,20 @@ def _tidy(snippet: str) -> str:
     return s
 
 
+def _present(snippet: str, cleaner=None) -> str:
+    """Optional AI cleaner (punctuation/casing) when provided, then the finance-aware ``_tidy``
+    heuristic. With ``cleaner`` None (default / model absent) this is just ``_tidy``."""
+    s = snippet
+    if cleaner is not None:
+        try:
+            s = cleaner.clean(snippet) or snippet
+        except Exception:
+            s = snippet
+    return _tidy(s)
+
+
 def extract_analysis_points(segments: List[Segment], universe: Set[str],
-                            max_points: int = 5) -> List[str]:
+                            max_points: int = 5, cleaner=None) -> List[str]:
     """The most analysis-dense sentences from (already promo-stripped) segments.
 
     Surfaces the 'critical analytics' — price levels, targets, valuations, catalysts, % moves —
@@ -621,7 +633,7 @@ def extract_analysis_points(segments: List[Segment], universe: Set[str],
             continue
         seen.add(key)
         snip = s if len(s) <= 200 else s[:197].rstrip() + "…"
-        scored.append((sc, idx, _tidy(snip)))
+        scored.append((sc, idx, _present(snip, cleaner)))
     # Top-scoring first, then restore chronological order among the picks.
     top = sorted(scored, key=lambda t: t[0], reverse=True)[:max_points]
     top.sort(key=lambda t: t[1])
@@ -749,7 +761,8 @@ class VideoAnalysis:
 
 
 def analyze_video(upload: Upload, segments: Optional[List[Segment]], universe: Set[str], *,
-                  analyzer=None, event_classifier=None, summarizer=None) -> VideoAnalysis:
+                  analyzer=None, event_classifier=None, summarizer=None,
+                  cleaner=None) -> VideoAnalysis:
     """Full per-video analysis. Falls back to title+description when there's no transcript.
 
     Promotional filler (like/subscribe CTAs, sponsor reads, referral spiels) is stripped up front
@@ -795,7 +808,7 @@ def analyze_video(upload: Upload, segments: Optional[List[Segment]], universe: S
     }
 
     conviction = {sym: score_conviction(text, cnt) for sym, cnt in tickers.items()}
-    analysis_points = extract_analysis_points(segs, universe)
+    analysis_points = extract_analysis_points(segs, universe, cleaner=cleaner)
     return VideoAnalysis(
         upload=upload, has_transcript=has_tx, text=text,
         sentiment=sentiment, sentiment_score=sscore, tickers=tickers,

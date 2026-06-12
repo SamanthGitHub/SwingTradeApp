@@ -7,6 +7,7 @@ fallback, so the app degrades gracefully when ``transformers`` / ``sentence-tran
 
 import difflib
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -139,6 +140,56 @@ class NewsSummarizer:
             return out[0]["summary_text"] if out else " · ".join(clean[:3])
         except Exception:
             return " · ".join(clean[:3])
+
+
+# ── Transcript cleanup (punctuation + casing restoration) ─────────────────────────
+
+def _recase(text: str) -> str:
+    """Capitalize sentence starts + standalone 'i', and tighten spaces around punctuation.
+
+    The punctuation model restores ``. , ? -`` etc. but keeps everything lowercase, so this adds
+    the casing. Finance-specific casing (company names, ``$cashtags``) is applied separately by
+    the YouTube ``_tidy`` step.
+    """
+    s = re.sub(r"\s+", " ", text or "").strip()
+    if not s:
+        return s
+    s = re.sub(r"\s+([,.!?;:])", r"\1", s)   # no space before punctuation
+    s = re.sub(r"\bi\b", "I", s)             # standalone "i" -> "I"
+    out, cap = [], True
+    for ch in s:
+        if cap and ch.isalpha():
+            ch, cap = ch.upper(), False
+        elif ch in ".!?":
+            cap = True
+        out.append(ch)
+    return "".join(out)
+
+
+class TranscriptCleaner:
+    """Restore punctuation + casing to noisy ASR transcripts (lowercase, unpunctuated).
+
+    Optional + local (mirrors the other AI features). Wraps the multilingual fullstop punctuation
+    model via ``deepmultilingualpunctuation``. Falls back to **returning the input unchanged** when
+    the package/model isn't installed or errors, so the caller's heuristic cleanup still applies.
+    """
+
+    def __init__(self) -> None:
+        self.model = None
+        try:
+            from deepmultilingualpunctuation import PunctuationModel
+            self.model = PunctuationModel()
+            logger.info("Loaded transcript cleaner (punctuation restoration)")
+        except Exception:
+            logger.info("Transcript cleaner unavailable — heuristic tidy only")
+
+    def clean(self, text: str) -> str:
+        if not text or self.model is None:
+            return text or ""
+        try:
+            return _recase(self.model.restore_punctuation(text))
+        except Exception:
+            return text
 
 
 # ── Novelty / dedup ──────────────────────────────────────────────────────────────

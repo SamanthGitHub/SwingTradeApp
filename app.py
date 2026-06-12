@@ -28,6 +28,7 @@ from swingtradeapp.nlp import (
     NewsEventClassifier,
     NewsNovelty,
     NewsSummarizer,
+    TranscriptCleaner,
     aggregate_news_sentiment,
 )
 from swingtradeapp.providers import ProviderFactory
@@ -107,6 +108,10 @@ def get_summarizer():
 @st.cache_resource(show_spinner="Loading novelty embedder…")
 def get_novelty():
     return NewsNovelty()
+
+@st.cache_resource(show_spinner="Loading transcript cleaner…")
+def get_transcript_cleaner():
+    return TranscriptCleaner()
 
 
 def _ai_on(key: str) -> bool:
@@ -3359,6 +3364,7 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
         analyzer = get_sentiment_analyzer(config)
         event_clf = get_event_classifier() if _ai_on("ai_events") else None
         summarizer = get_summarizer() if _ai_on("ai_summary") else None
+        cleaner = get_transcript_cleaner() if _ai_on("ai_clean") else None
 
         # ── Fetch + analyze ──────────────────────────────────────────────────
         analyses: List[yt.VideoAnalysis] = []
@@ -3381,7 +3387,8 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
                 segs = get_yt_transcript(up.video_id)
                 analyses.append(yt.analyze_video(
                     up, segs, universe,
-                    analyzer=analyzer, event_classifier=event_clf, summarizer=summarizer))
+                    analyzer=analyzer, event_classifier=event_clf, summarizer=summarizer,
+                    cleaner=cleaner))
                 prog.progress((i + 1) / len(uploads), text=f"Analyzed {i + 1}/{len(uploads)} videos")
             prog.empty()
 
@@ -3686,8 +3693,13 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
             st.session_state["ai_novelty"] = st.checkbox(
                 "Semantic news novelty", value=_ai_on("ai_novelty"),
                 help="Dedup recycled headlines via sentence-transformers")
+            st.session_state["ai_clean"] = st.checkbox(
+                "Transcript cleanup (punctuation & casing)", value=_ai_on("ai_clean"),
+                help="Restore punctuation + casing to messy YouTube auto-captions so the digest "
+                     "and key analysis points read cleanly (deepmultilingualpunctuation). Falls "
+                     "back to the heuristic tidy when the model isn't installed.")
         st.caption("Forecast appears on Auto Watchlist + Screener drill-down; news AI on the "
-                   "Screener drill-down.")
+                   "Screener drill-down; transcript cleanup on the YouTube screen.")
 
         st.markdown("**ML signal model** — uses scikit-learn (already installed; no extra download)")
         st.session_state["ai_ml_signal"] = st.checkbox(

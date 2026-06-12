@@ -5,7 +5,10 @@
 # Install into the same venv after the first run:
 #   source ~/.swingtradeapp/venv/bin/activate
 #   pip install -r requirements-ai.txt
-transformers>=4.40
+# transformers pinned <5: deepmultilingualpunctuation uses the pre-5 `grouped_entities` pipeline
+# arg (removed in transformers 5); the other models here all work on the 4.x line.
+transformers>=4.40,<5
 torch>=2.2
 chronos-forecasting>=1.4
 sentence-transformers>=2.6
+deepmultilingualpunctuation>=1.0  # YouTube transcript cleanup (punctuation + casing restoration)
