@@ -38,6 +38,7 @@ from swingtradeapp.signals import TrendSignalGenerator
 from swingtradeapp.tickers import get_raw_screen, get_screening_universe, get_tradable_universe
 from swingtradeapp import ui
 from swingtradeapp import youtube as yt
+from swingtradeapp import alpha_engine, alpha_factors, alpha_ml
 from swingtradeapp import confluence as cf
 from swingtradeapp import analysis_guide as ag
 from swingtradeapp import insiders as ins
@@ -522,6 +523,7 @@ RECOMMENDED_TIMES: Dict[str, str] = {
     "Market Events": "Pre-open ~8:00 AM ET, or midday for a fresh read",
     "Heat Map": "Intraday or after the close",
     "YouTube": "Evening / after the close (creators post post-market)",
+    "Alpha Engine": "After the close (uses completed daily bars) — or any time to inspect the book",
 }
 
 
@@ -1594,6 +1596,111 @@ def _spy_trend() -> str:
     if last < s20 < s50:
         return "down"
     return "mixed"
+
+
+# ── Alpha Engine data (curated universe + cached panel/benchmark fetchers) ───────
+
+# Curated, liquid, large-cap cross-section. Deliberately fixed (not "today's most actives") so the
+# backtest is reproducible; liquid mega/large caps also minimise (never eliminate) survivorship bias.
+ALPHA_UNIVERSE = [
+    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "AVGO", "TSLA", "ORCL", "CRM", "ADBE", "AMD",
+    "INTC", "CSCO", "QCOM", "TXN", "IBM", "NOW", "INTU", "AMAT", "MU", "ADI", "LRCX", "KLAC",
+    "NFLX", "DIS", "CMCSA", "T", "VZ", "TMUS",
+    "HD", "MCD", "NKE", "LOW", "SBUX", "BKNG", "TJX",
+    "PG", "KO", "PEP", "COST", "WMT", "PM", "MO", "MDLZ", "CL",
+    "UNH", "JNJ", "LLY", "ABBV", "MRK", "PFE", "TMO", "ABT", "DHR", "AMGN", "BMY",
+    "JPM", "BAC", "WFC", "GS", "MS", "V", "MA", "AXP", "SPGI", "BLK", "C", "SCHW",
+    "CAT", "GE", "BA", "HON", "UPS", "RTX", "UNP", "DE", "LMT",
+    "XOM", "CVX", "COP", "SLB", "EOG",
+    "LIN", "SHW", "FCX", "NEE", "DUK", "SO",
+]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_price_panel(symbols: tuple, years: int) -> pd.DataFrame:
+    """Adjusted-close price panel (dates × symbols) for the Alpha Engine, cached 1h.
+
+    One batched yfinance call. Drops symbols missing >30% of the window so a few data gaps don't
+    poison the cross-section. Forward-fills small holes.
+    """
+    import yfinance as yf
+    try:
+        raw = yf.download(list(symbols), period=f"{years}y", auto_adjust=True, progress=False)
+    except Exception:
+        return pd.DataFrame()
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    close = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Close"]]
+    if isinstance(close, pd.Series):
+        close = close.to_frame()
+    close = close.dropna(how="all")
+    if close.empty:
+        return pd.DataFrame()
+    return close.dropna(axis=1, thresh=int(len(close) * 0.7)).ffill()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_close_series(symbol: str, years: int) -> pd.Series:
+    """Single-symbol adjusted-close series (for SPY benchmark and ^VIX regime), cached 1h."""
+    import yfinance as yf
+    try:
+        raw = yf.download(symbol, period=f"{years}y", auto_adjust=True, progress=False)
+    except Exception:
+        return pd.Series(dtype=float)
+    if raw is None or raw.empty:
+        return pd.Series(dtype=float)
+    c = raw["Close"]
+    return c.iloc[:, 0] if isinstance(c, pd.DataFrame) else c
+
+
+def _vix_regime(vix: pd.Series, calm: float = 18.0, stress: float = 35.0, floor: float = 0.4) -> pd.Series:
+    """Map VIX → gross-exposure multiplier in [floor, 1]: full risk when calm, scaled down into stress."""
+    r = 1.0 - (vix - calm) / (stress - calm) * (1.0 - floor)
+    return r.clip(lower=floor, upper=1.0)
+
+
+# GICS-ish sector map for the curated universe (used for sector-neutral ranking).
+ALPHA_SECTORS = {
+    **{s: "Technology" for s in ["AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "CRM", "ADBE", "AMD",
+                                 "INTC", "CSCO", "QCOM", "TXN", "IBM", "NOW", "INTU", "AMAT", "MU",
+                                 "ADI", "LRCX", "KLAC"]},
+    **{s: "Communication" for s in ["GOOGL", "META", "NFLX", "DIS", "CMCSA", "T", "VZ", "TMUS"]},
+    **{s: "Cons. Disc." for s in ["AMZN", "TSLA", "HD", "MCD", "NKE", "LOW", "SBUX", "BKNG", "TJX"]},
+    **{s: "Cons. Staples" for s in ["PG", "KO", "PEP", "COST", "WMT", "PM", "MO", "MDLZ", "CL"]},
+    **{s: "Health Care" for s in ["UNH", "JNJ", "LLY", "ABBV", "MRK", "PFE", "TMO", "ABT", "DHR",
+                                  "AMGN", "BMY"]},
+    **{s: "Financials" for s in ["JPM", "BAC", "WFC", "GS", "MS", "V", "MA", "AXP", "SPGI", "BLK",
+                                 "C", "SCHW"]},
+    **{s: "Industrials" for s in ["CAT", "GE", "BA", "HON", "UPS", "RTX", "UNP", "DE", "LMT"]},
+    **{s: "Energy" for s in ["XOM", "CVX", "COP", "SLB", "EOG"]},
+    **{s: "Materials" for s in ["LIN", "SHW", "FCX"]},
+    **{s: "Utilities" for s in ["NEE", "DUK", "SO"]},
+}
+
+# Geopolitical / macro stress scenarios. Shocks are expressed as returns of factor proxies:
+# mkt=SPY, oil=CL=F, rates=TLT (long bond price; rates-up = TLT down), usd=UUP.
+ALPHA_SCENARIOS = {
+    "Geopolitical risk-off": {"mkt": -0.08, "oil": 0.15, "rates": 0.03, "usd": 0.03},
+    "Oil shock (war/OPEC)": {"oil": 0.30, "mkt": -0.05, "usd": 0.02},
+    "Hawkish rate shock": {"rates": -0.08, "mkt": -0.05},
+    "Credit / growth scare": {"mkt": -0.12, "rates": 0.05, "oil": -0.10},
+    "Risk-on rally": {"mkt": 0.05, "oil": 0.02, "rates": -0.01},
+}
+ALPHA_FACTOR_PROXIES = {"mkt": "SPY", "oil": "CL=F", "rates": "TLT", "usd": "UUP"}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_volume_panel(symbols: tuple, years: int) -> pd.DataFrame:
+    """Share-volume panel (dates × symbols) for ADV-based impact costs, cached 1h. One batched call."""
+    import yfinance as yf
+    try:
+        raw = yf.download(list(symbols), period=f"{years}y", auto_adjust=True, progress=False)
+    except Exception:
+        return pd.DataFrame()
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    v = raw["Volume"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Volume"]]
+    return v.to_frame() if isinstance(v, pd.Series) else v
 
 
 # ── Chart helpers ──────────────────────────────────────────────────────────────
@@ -3950,6 +4057,234 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
 
             _render_legend()
 
+    # ═══════════════════════ ALPHA ENGINE (QUANT FACTOR BOOK) ════════════════
+    elif page == "Alpha Engine":
+        st.header("🧠 Alpha Engine — cross-sectional factor book")
+        st.caption("A quant long(/short) book: every period it ranks a liquid universe on **momentum · "
+                   "trend · 52-week-high · low-volatility · reversal**, sizes inverse-vol with caps, "
+                   "optionally tilts by an **ML meta-label** P(beat peers) and gates exposure by a "
+                   "**VIX regime**. Shows **today's book** + a **lookahead-free** out-of-sample backtest.")
+        st.caption("⚠️ Educational, not advice. Free daily data can't remove **survivorship bias** "
+                   "(delisted names are gone), so live results run weaker than the backtest — but "
+                   "**lookahead bias is removed** (factors use only past data; weights aren't fit in-sample).")
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            uni_n = st.slider("Universe size", 20, len(ALPHA_UNIVERSE), 60, 10)
+        with c2:
+            years = st.slider("Backtest years", 2, 10, 6, 1)
+        with c3:
+            freq_label = st.selectbox("Rebalance", ["Weekly", "Monthly"], index=0)
+        with c4:
+            topq = st.slider("Long top %", 5, 50, 25, 5)
+        a1, a2, a3, a4 = st.columns(4)
+        with a1:
+            ls = st.checkbox("Long / Short", value=False, help="Also short the bottom quantile")
+        with a2:
+            use_ml = st.checkbox("ML meta-label", value=True, help="P(beat peers) tilt + gentle filter")
+        with a3:
+            use_regime = st.checkbox("VIX regime gating", value=True, help="Cut gross exposure when VIX is high")
+        with a4:
+            sector_neutral = st.checkbox("Sector-neutral", value=False,
+                                         help="Rank names vs their sector peers — strips out sector bets, "
+                                              "isolating stock-selection alpha")
+
+        with st.expander("⚙️ Institutional realism — impact costs · overfitting checks · stress tests"):
+            r1, r2, r3 = st.columns(3)
+            with r1:
+                cost_mode = st.radio("Cost model", ["ADV market-impact", "Flat bps"], index=0,
+                                     help="ADV impact scales cost with the % of daily volume you'd trade "
+                                          "— honest for larger books")
+            with r2:
+                if cost_mode.startswith("ADV"):
+                    aum_m = st.number_input("Book size ($M)", 0.1, 5000.0, 5.0, 0.5,
+                                            help="Bigger books pay more market impact, especially in thin names")
+                    cost = 10.0
+                else:
+                    cost = float(st.slider("Cost (bps/side)", 0, 50, 10, 5))
+                    aum_m = 5.0
+            with r3:
+                show_overfit = st.checkbox("Anti-overfitting (PSR / DSR)", value=True)
+                show_stress = st.checkbox("Geopolitical stress tests", value=True)
+        cost_model = "impact" if cost_mode.startswith("ADV") else "flat"
+
+        if not scan_gate("alpha", RECOMMENDED_TIMES["Alpha Engine"],
+                         clear=lambda: (fetch_price_panel.clear(), fetch_close_series.clear(),
+                                        fetch_volume_panel.clear())):
+            st.stop()
+
+        universe = tuple(ALPHA_UNIVERSE[:uni_n])
+        with st.spinner(f"Downloading {len(universe)} symbols × {years}y of daily bars…"):
+            prices = fetch_price_panel(universe, years)
+        if prices.empty or prices.shape[1] < 10:
+            st.warning("Couldn't build a price panel (data feed). Try again, or a smaller universe.")
+            st.stop()
+
+        freq = "W-FRI" if freq_label == "Weekly" else "M"
+        horizon = 5 if freq_label == "Weekly" else 21
+
+        with st.spinner("Computing factors & cross-sectional ranking…"):
+            panels = alpha_factors.composite_score(prices)
+        composite_used = panels["composite"]
+        if sector_neutral:
+            composite_used = alpha_factors.sector_neutralize(composite_used, ALPHA_SECTORS)
+
+        prob = None
+        if use_ml:
+            with st.spinner("Training walk-forward meta-label (out-of-sample)…"):
+                prob = alpha_ml.walkforward_proba(
+                    prices, panels, alpha_engine.rebalance_dates(prices.index, freq), horizon=horizon)
+            if prob is None:
+                st.caption("ℹ️ ML meta-label unavailable (scikit-learn or insufficient history) — "
+                           "running factor-only.")
+
+        bench = fetch_close_series("SPY", years).reindex(prices.index).pct_change()
+        regime = None
+        if use_regime:
+            vix = fetch_close_series("^VIX", years).reindex(prices.index).ffill()
+            if not vix.dropna().empty:
+                regime = _vix_regime(vix).reindex(prices.index).ffill().fillna(1.0)
+
+        volume = None
+        if cost_model == "impact":
+            volume = fetch_volume_panel(universe, years).reindex(index=prices.index,
+                                                                 columns=prices.columns)
+            if volume.empty or volume.isna().all().all():
+                cost_model, volume = "flat", None
+                st.caption("ℹ️ Volume feed unavailable — falling back to flat costs.")
+
+        bt_kw = dict(freq=freq, top_quantile=topq / 100.0, long_short=ls, regime=regime,
+                     cost_model=cost_model, cost_bps=float(cost), volume=volume, aum=aum_m * 1e6)
+        with st.spinner("Running lookahead-free walk-forward backtest…"):
+            res = alpha_engine.run_backtest(prices, composite=composite_used, prob=prob,
+                                            prob_floor=0.5, benchmark=bench, **bt_kw)
+
+        m, bm = res["metrics"], res["benchmark_metrics"]
+
+        def _f(d, k):
+            v = d.get(k)
+            return v if v is not None and v == v else float("nan")
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("CAGR", f"{_f(m,'CAGR'):.2%}", f"{_f(m,'CAGR')-_f(bm,'CAGR'):+.2%} vs SPY")
+        k2.metric("Sharpe", f"{_f(m,'Sharpe'):.2f}", f"SPY {_f(bm,'Sharpe'):.2f}")
+        k3.metric("Max DD", f"{_f(m,'MaxDD'):.2%}", f"SPY {_f(bm,'MaxDD'):.2%}")
+        k4.metric("Alpha (ann)", f"{_f(m,'Alpha'):.2%}")
+        k5.metric("Beta", f"{_f(m,'Beta'):.2f}")
+
+        eq = res["equity"]
+        beq = (1.0 + bench.reindex(eq.index).fillna(0.0)).cumprod()
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=eq.index, y=eq.values, name="Alpha Engine",
+                                 line=dict(color="#00c851", width=2)))
+        fig.add_trace(go.Scatter(x=beq.index, y=beq.values, name="SPY (buy & hold)",
+                                 line=dict(color="#888888", width=1, dash="dash")))
+        fig.update_layout(
+            height=400, margin=dict(t=48, b=70, l=10, r=10), hovermode="x unified",
+            title=dict(text="Out-of-sample growth of $1 (net of costs)", x=0.5, xanchor="center",
+                       y=0.96, yanchor="top"),
+            legend=dict(orientation="h", yanchor="top", y=-0.18, xanchor="center", x=0.5))
+        st.plotly_chart(fig, use_container_width=True, key="alpha_equity")
+
+        with st.expander("All metrics — strategy vs SPY"):
+            order = ["CAGR", "Vol", "Sharpe", "Sortino", "MaxDD", "Calmar", "HitRate",
+                     "ProfitFactor", "Alpha", "Beta"]
+            mt = pd.DataFrame({"Strategy": {k: _f(m, k) for k in order},
+                               "SPY": {k: _f(bm, k) for k in order}})
+            st.dataframe(mt.style.format("{:.3f}", na_rep="—"), use_container_width=True)
+            yrs = max(len(res["returns"]) / 252.0, 1e-9)
+            cost_txt = (f"ADV market-impact @ ${aum_m:.1f}M book" if cost_model == "impact"
+                        else f"flat {cost:.0f} bps/side")
+            st.caption(f"Rebalances: {len(res['rebalances'])} · turnover "
+                       f"{res['turnover'].sum()/yrs:.1f}x/yr · live ~{yrs:.1f}y · costs: {cost_txt}"
+                       + (" · sector-neutral" if sector_neutral else ""))
+
+        # ── Is the edge real? Probabilistic + Deflated Sharpe over a config grid ──
+        if show_overfit:
+            with st.spinner("Estimating overfitting risk across a config grid…"):
+                trials = []
+                for tq2 in (0.15, 0.25, 0.35):
+                    for fr2 in ("W-FRI", "M"):
+                        trials.append(alpha_engine.run_backtest(
+                            prices, composite=composite_used,
+                            **{**bt_kw, "freq": fr2, "top_quantile": tq2})["returns"])
+                psr = alpha_engine.probabilistic_sharpe_ratio(res["returns"])
+                dsr = alpha_engine.deflated_sharpe_ratio(res["returns"], trials)
+            st.subheader("🧪 Is the edge real?")
+            o1, o2 = st.columns(2)
+            o1.metric("Probabilistic Sharpe", f"{psr:.1%}",
+                      help="P(true Sharpe > 0), adjusted for sample length and non-normal returns")
+            o2.metric("Deflated Sharpe", f"{dsr['DSR']:.1%}",
+                      help=f"PSR vs the Sharpe expected by luck across {dsr['n_trials']} configs tried "
+                           f"(luck-benchmark ≈ {dsr['SR0_ann']:.2f} ann.)")
+            verdict = ("🟢 Looks robust" if dsr["DSR"] >= 0.95 else
+                       "🟡 Borderline — treat with caution" if dsr["DSR"] >= 0.80 else
+                       "🔴 Likely overfit / not statistically significant")
+            st.caption(f"{verdict}. Deflated Sharpe corrects for having *tried multiple configurations* — "
+                       "a high raw Sharpe that collapses here was probably curve-fitting.")
+
+        # ── Geopolitical stress tests on today's book ────────────────────────
+        if show_stress:
+            book0 = res["latest_book"]
+            held = [s for s in book0["Symbol"].tolist() if s in prices.columns] if not book0.empty else []
+            if held:
+                with st.spinner("Stress-testing today's book against macro shocks…"):
+                    w = book0.set_index("Symbol")["Weight"]
+                    fac_ret = pd.DataFrame({
+                        k: fetch_close_series(tk, years).reindex(prices.index).pct_change()
+                        for k, tk in ALPHA_FACTOR_PROXIES.items()})
+                    betas = alpha_engine.factor_betas(prices[held].pct_change(), fac_ret)
+                    stress = alpha_engine.scenario_pnl(w, betas, ALPHA_SCENARIOS)
+                st.subheader("🌍 Geopolitical stress tests (today's book)")
+
+                def _pnl_c(v):
+                    try:
+                        return "color:#00c851" if float(v) > 0 else ("color:#ff4444" if float(v) < 0 else "")
+                    except (TypeError, ValueError):
+                        return ""
+
+                st.dataframe(
+                    stress.style.format({"Est. P&L %": "{:+.2f}%"}).map(_pnl_c, subset=["Est. P&L %"]),
+                    use_container_width=True, hide_index=True)
+                st.caption("Estimated one-day P&L if each shock hit, from the book's betas to SPY · oil "
+                           "(CL=F) · long bonds (TLT) · USD (UUP). First-order (ignores idiosyncratic moves "
+                           "& convexity) — a planning aid, **not** a prediction.")
+
+        st.subheader("📋 Today's book")
+        book = res["latest_book"]
+        if book.empty:
+            st.caption("No rankable book for the latest session.")
+        else:
+            gross_txt = f"gross {book['Weight'].abs().sum():.0%}"
+            net_txt = f" · net {book['Weight'].sum():+.0%}" if ls else ""
+            st.caption(f"{len(book)} positions · {gross_txt}{net_txt} · "
+                       f"sized inverse-vol, capped, "
+                       f"{'meta-label tilted' if prob is not None else 'factor-only'}"
+                       f"{', regime-scaled' if regime is not None else ''}.")
+            st.dataframe(
+                book.style.format({"Weight": "{:.2%}", "Score": "{:.2f}", "Vol": "{:.2%}",
+                                   "Price": "${:.2f}"}, na_rep="—")
+                    .map(lambda v: "color:#00c851;font-weight:bold" if v == "LONG"
+                         else "color:#ff4444;font-weight:bold", subset=["Side"]),
+                use_container_width=True, hide_index=True, height=min(460, 80 + 34 * len(book)))
+            st.download_button("Download book CSV", book.to_csv(index=False),
+                               file_name=f"alpha_book_{datetime.now():%Y%m%d}.csv", mime="text/csv")
+
+        with st.expander("ℹ️ How this works / how to read it"):
+            st.markdown(
+                "- **Factors** (all 'higher = more long-worthy'): 12-1 momentum, price-vs-200d trend, "
+                "proximity to the 52-week high, *low* realized volatility, and short-term reversal. "
+                "Each is z-scored across names every day, then blended into one **composite**.\n"
+                "- **Book**: longs the top *N%* of the composite (and shorts the bottom if Long/Short), "
+                "sizes **inverse-volatility** (calmer names get more), caps any single name, and scales "
+                "total exposure by the **VIX regime**.\n"
+                "- **ML meta-label**: a walk-forward classifier estimates P(a pick beats its peers next "
+                "period) and tilts/filters the book — never collapsing diversification.\n"
+                "- **Backtest**: rebalanced weekly/monthly, **no lookahead** (trades the day *after* each "
+                "signal), net of your cost assumption. **Alpha/Beta** are vs SPY.\n"
+                "- **Reality check**: the universe is *currently listed* names, so the backtest still "
+                "flatters (survivorship). Treat it as a rigorous *relative* tool, not a promise.")
+
     elif page == "Insider Activity":
         st.header("🕵️ Insider Activity")
         st.caption("Real SEC **Form 4** filings — corporate insiders (officers, directors, 10%+ "
@@ -3962,9 +4297,9 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
                                  key="insider_sym").strip().upper()
         with ic2:
             st.write("")
-            go = st.button("Look up", use_container_width=True, type="primary")
+            do_lookup = st.button("Look up", use_container_width=True, type="primary")
 
-        if isym and (go or st.session_state.get("_insider_last") == isym):
+        if isym and (do_lookup or st.session_state.get("_insider_last") == isym):
             st.session_state["_insider_last"] = isym
             with st.spinner(f"Fetching insider filings for {isym}…"):
                 data = fetch_insider(isym)

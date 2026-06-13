@@ -32,6 +32,7 @@ NAV_ITEMS: List[Tuple[str, str, str]] = [
     ("Morning Insights", "sun", "☀️"),  # auto-runs (no Scan button) — pre-open briefing
     ("Rally Radar", "rocket-takeoff", "🚀"),  # early / pre-breakout momentum-ignition setups
     ("Signal Stack", "layers", "🧩"),  # synthesis of the other screens
+    ("Alpha Engine", "cpu", "🧠"),  # cross-sectional factor book + lookahead-free backtest
     ("ETF Screener", "grid-3x3-gap", "🗂️"),
     ("Auto Watchlist", "stars", "⭐"),
     # What's moving now (by session) + market overview
