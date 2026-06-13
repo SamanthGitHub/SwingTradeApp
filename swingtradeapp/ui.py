@@ -29,6 +29,7 @@ ACCENT_DARK = "#00a843"
 NAV_ITEMS: List[Tuple[str, str, str]] = [
     # Find ideas
     ("Screener", "graph-up", "📈"),
+    ("Morning Insights", "sun", "☀️"),  # auto-runs (no Scan button) — pre-open briefing
     ("Rally Radar", "rocket-takeoff", "🚀"),  # early / pre-breakout momentum-ignition setups
     ("Signal Stack", "layers", "🧩"),  # synthesis of the other screens
     ("ETF Screener", "grid-3x3-gap", "🗂️"),
