@@ -20,47 +20,55 @@ import streamlit as st
 ACCENT = "#00c851"
 ACCENT_DARK = "#00a843"
 
-# (page label, Bootstrap icon name, emoji fallback). The LABEL must stay byte-identical to the
-# `if page == "..."` branches in app.py — it is the routing key.
-# Ordered as a trader's workflow: find ideas → see what's moving → dig into signals →
-# research the story → track your own positions → help & config. Labels MUST stay
-# byte-identical to the `page == "…"` branches in app.py (they're the routing keys);
-# only the order changes here.
-NAV_ITEMS: List[Tuple[str, str, str]] = [
-    # Find ideas
-    ("Screener", "graph-up", "📈"),
-    ("Morning Insights", "sun", "☀️"),  # auto-runs (no Scan button) — pre-open briefing
-    ("Rally Radar", "rocket-takeoff", "🚀"),  # early / pre-breakout momentum-ignition setups
-    ("Setup Scanner", "ui-checks-grid", "🧭"),  # named research-backed setups w/ entry/stop/target
-    ("Backtest Lab", "clipboard-data", "🧪"),  # validate any setup on expectancy, not win rate
-    ("Signal Stack", "layers", "🧩"),  # synthesis of the other screens
-    ("Alpha Engine", "cpu", "🧠"),  # cross-sectional factor book + lookahead-free backtest
-    ("ETF Screener", "grid-3x3-gap", "🗂️"),
-    ("Auto Watchlist", "stars", "⭐"),
-    # What's moving now (by session) + market overview
-    ("Pre-Market Movers", "sunrise", "🌅"),
-    ("Live Movers", "lightning-charge", "⚡"),
-    ("After-Hours & IPOs", "moon-stars", "🌙"),
-    ("Market Regime", "thermometer-half", "🌡️"),  # daily-bias gate + weekday seasonality
-    ("Heat Map", "fire", "🔥"),
-    # Deeper signals & forecasts
-    ("Whale Movements", "water", "🐋"),
-    ("Insider Activity", "person-badge", "🕵️"),
-    ("Options Flow", "graph-up-arrow", "🎯"),
-    ("Predictions", "magic", "🔮"),
-    # News & sentiment research
-    ("Market Events", "newspaper", "📰"),
-    ("YouTube", "youtube", "📺"),
-    # Track & manage my positions
-    ("Watchlists", "bookmark-star", "🔖"),
-    ("Compare", "bar-chart-line", "📊"),
-    ("P&L Tracker", "journal-text", "📒"),
-    ("Alerts", "bell", "🔔"),
-    # Help & config
-    ("How to Analyze", "mortarboard", "🎓"),
-    ("Information", "info-circle", "ℹ️"),
-    ("Settings", "gear", "⚙️"),
+# Navigation is organised into labelled sections (a trader's workflow: find ideas → see what's
+# moving → dig into signals → research → track positions → help/config). The page LABEL in each
+# tuple must stay byte-identical to the `if page == "..."` branches in app.py — it's the routing
+# key. `NAV_ITEMS` (the flat list used by `current_page`/routing) is derived from `NAV_GROUPS`.
+NAV_GROUPS: List[Tuple[str, List[Tuple[str, str, str]]]] = [
+    ("Find ideas", [
+        ("Screener", "graph-up", "📈"),
+        ("Morning Insights", "sun", "☀️"),  # auto-runs (no Scan button) — pre-open briefing
+        ("Rally Radar", "rocket-takeoff", "🚀"),  # early / pre-breakout momentum-ignition setups
+        ("Setup Scanner", "ui-checks-grid", "🧭"),  # named research-backed setups w/ entry/stop/target
+        ("Backtest Lab", "clipboard-data", "🧪"),  # validate any setup on expectancy, not win rate
+        ("Signal Stack", "layers", "🧩"),  # synthesis of the other screens
+        ("Alpha Engine", "cpu", "🧠"),  # cross-sectional factor book + lookahead-free backtest
+        ("ETF Screener", "grid-3x3-gap", "🗂️"),
+        ("Auto Watchlist", "stars", "⭐"),
+    ]),
+    ("What's moving", [
+        ("Pre-Market Movers", "sunrise", "🌅"),
+        ("Live Movers", "lightning-charge", "⚡"),
+        ("After-Hours & IPOs", "moon-stars", "🌙"),
+        ("Market Regime", "thermometer-half", "🌡️"),  # daily-bias gate + weekday seasonality
+        ("Heat Map", "fire", "🔥"),
+    ]),
+    ("Deeper signals", [
+        ("Whale Movements", "water", "🐋"),
+        ("Insider Activity", "person-badge", "🕵️"),
+        ("Options Flow", "graph-up-arrow", "🎯"),
+        ("Predictions", "magic", "🔮"),
+    ]),
+    ("Research", [
+        ("Market Events", "newspaper", "📰"),
+        ("YouTube", "youtube", "📺"),
+    ]),
+    ("My positions", [
+        ("Watchlists", "bookmark-star", "🔖"),
+        ("Compare", "bar-chart-line", "📊"),
+        ("P&L Tracker", "journal-text", "📒"),
+        ("Alerts", "bell", "🔔"),
+    ]),
+    ("Help & config", [
+        ("How to Analyze", "mortarboard", "🎓"),
+        ("Information", "info-circle", "ℹ️"),
+        ("Settings", "gear", "⚙️"),
+    ]),
 ]
+
+# Flat list (routing keys + ordering) derived from the grouped structure — keep using this
+# everywhere a simple list of pages is needed (e.g. `current_page`).
+NAV_ITEMS: List[Tuple[str, str, str]] = [item for _title, items in NAV_GROUPS for item in items]
 
 _BRAND_CSS = f"""
 <style>
@@ -193,6 +201,12 @@ footer {{visibility: hidden;}}
 /* ── Sidebar nav as real anchor links (so right-click → "open in new tab" works and lands on
    that screen via the ?page= URL param). Styled to match the old option-menu. ── */
 .stp-nav {{ display: flex; flex-direction: column; gap: 0.12rem; }}
+.stp-nav-section-title {{
+    margin: 0.75rem 0 0.25rem; padding: 0 0.2rem;
+    font-size: 0.70rem; font-weight: 700; letter-spacing: 0.07em;
+    text-transform: uppercase; color: #6b7280; opacity: 0.85;
+}}
+.stp-nav-section-title:first-child {{ margin-top: 0.1rem; }}
 .stp-nav-link {{
     display: flex; align-items: center; gap: 0.6rem;
     padding: 0.5rem 0.75rem; border-radius: 0.5rem;
@@ -409,18 +423,22 @@ def render_nav() -> str:
     string always matches a ``NAV_ITEMS`` label / ``page ==`` branch in app.py.
     """
     active = current_page()
-    links = []
-    for label, _icon, emoji in NAV_ITEMS:
-        href = "?page=" + urllib.parse.quote(label, safe="")
-        cls = "stp-nav-link active" if label == active else "stp-nav-link"
-        links.append(
-            f'<a class="{cls}" href="{href}" target="_self">'
-            f'<span class="stp-nav-ico">{emoji}</span>'
-            f'<span class="stp-nav-txt">{html.escape(label)}</span></a>'
-        )
     with st.sidebar:
         st.markdown("#### Navigation")
-        st.markdown(f'<nav class="stp-nav" aria-label="Primary navigation">{"".join(links)}</nav>',
-                    unsafe_allow_html=True)
+        for title, items in NAV_GROUPS:
+            links = []
+            for label, _icon, emoji in items:
+                href = "?page=" + urllib.parse.quote(label, safe="")
+                cls = "stp-nav-link active" if label == active else "stp-nav-link"
+                links.append(
+                    f'<a class="{cls}" href="{href}" target="_self">'
+                    f'<span class="stp-nav-ico">{emoji}</span>'
+                    f'<span class="stp-nav-txt">{html.escape(label)}</span></a>'
+                )
+            st.markdown(
+                f'<div class="stp-nav-section-title">{html.escape(title)}</div>'
+                f'<nav class="stp-nav" aria-label="{html.escape(title)}">{"".join(links)}</nav>',
+                unsafe_allow_html=True,
+            )
         st.caption("💡 Right-click a screen → *Open in new tab* to work on several at once.")
     return active

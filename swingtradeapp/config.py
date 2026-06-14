@@ -27,6 +27,10 @@ class TradingConfig:
     slippage_bps: float = 5.0
     commission_bps: float = 1.0
 
+    # Optional third-party data-provider keys (used only on their FREE tier, hard-capped by
+    # swingtradeapp.ratelimit so we never exceed the free limit). Blank = provider disabled.
+    polygon_api_key: str = ''
+
     @classmethod
     def load_from_env(cls) -> 'TradingConfig':
         env_path = Path('.').joinpath('.env')
@@ -54,6 +58,8 @@ class TradingConfig:
                     setattr(cfg, field_name, float(raw))
                 except ValueError:
                     pass
+        # Optional free-tier data-provider keys.
+        cfg.polygon_api_key = os.environ.get('POLYGON_API_KEY', '')
         if not cfg.alpaca_api_key:
             cfg.offline_mode = True
         return cfg

@@ -2,6 +2,7 @@
 
 import json
 import math
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,7 +32,8 @@ from swingtradeapp.nlp import (
     TranscriptCleaner,
     aggregate_news_sentiment,
 )
-from swingtradeapp.providers import ProviderFactory
+from swingtradeapp.providers import ProviderFactory, PolygonProvider
+from swingtradeapp.ratelimit import ApiBudget, PROVIDERS
 from swingtradeapp.retry import with_retry
 from swingtradeapp.risk import BayesianKellySizer
 from swingtradeapp.signals import TrendSignalGenerator
@@ -83,6 +85,29 @@ def get_macro_context():
 @st.cache_resource
 def get_backtest_engine(config):
     return VectorBacktestEngine(config)
+
+
+@st.cache_resource
+def get_api_budget():
+    """Shared free-tier usage ledger (hard-stops before any provider's limit)."""
+    return ApiBudget()
+
+
+def _polygon_key() -> str:
+    """Polygon key: a key typed in Settings (session) wins, then config/.env, then env."""
+    return str(st.session_state.get("polygon_api_key")
+               or getattr(get_config(), "polygon_api_key", "")
+               or os.environ.get("POLYGON_API_KEY", "")).strip()
+
+
+def get_polygon_provider() -> PolygonProvider:
+    """Budget-guarded Polygon provider (cheap to build; reads the key dynamically)."""
+    return PolygonProvider(api_key=_polygon_key(), budget=get_api_budget())
+
+
+def _provider_on(key: str) -> bool:
+    """Whether a data provider is enabled via its Settings → Data & APIs toggle."""
+    return bool(st.session_state.get(f"use_{key}", False))
 
 @st.cache_resource
 def get_options_analyzer():
@@ -146,6 +171,47 @@ def fetch_symbol_history(symbol: str, days: int = 90) -> pd.DataFrame:
         return data[cols].dropna()
     except Exception:
         return pd.DataFrame()
+
+
+def fetch_history_ondemand(symbol: str, days: int = 90):
+    """Single-symbol price history, provider-aware. Returns ``(df, source_label, note)``.
+
+    Uses Polygon/Massive when it's enabled, keyed, and within its free-tier budget; otherwise (or
+    when the per-minute budget is exhausted) falls back to free yfinance with a notice. **Only for
+    on-demand single-symbol views** (drill-down charts, one-ticker lookups) — bulk scans must call
+    ``fetch_symbol_history`` directly so they never hit Polygon's 5/min cap.
+    """
+    if _provider_on("polygon") and _polygon_key():
+        allowed, reason = get_api_budget().check("polygon")
+        if allowed:
+            df = get_polygon_provider().fetch_daily_bars(symbol, days=days)
+            if df is not None and not df.empty:
+                return df, "Polygon · Massive", None
+            return fetch_symbol_history(symbol, days=days), "Yahoo · free", None
+        return (fetch_symbol_history(symbol, days=days), "Yahoo · free",
+                f"Polygon {reason} reached — using free data.")
+    return fetch_symbol_history(symbol, days=days), "Yahoo · free", None
+
+
+def _persist_env(key: str, value: str) -> None:
+    """Write/update a ``KEY=value`` line in the gitignored ``.env`` so a key entered in Settings
+    survives restarts, and mirror it into the live process env."""
+    try:
+        p = Path(".env")
+        lines = p.read_text().splitlines() if p.exists() else []
+        out, found = [], False
+        for ln in lines:
+            if ln.strip().startswith(f"{key}="):
+                out.append(f"{key}={value}")
+                found = True
+            else:
+                out.append(ln)
+        if not found:
+            out.append(f"{key}={value}")
+        p.write_text("\n".join(out) + "\n")
+        os.environ[key] = value
+    except Exception:
+        pass
 
 
 @st.cache_data(ttl=3600)
@@ -1977,7 +2043,7 @@ def render_alpha_simple_plan(res, account, m, bm, dsr, pbo, reasons=None) -> Non
 # ── Chart helpers ──────────────────────────────────────────────────────────────
 
 def create_price_chart(symbol: str, signal_row: Optional[pd.Series] = None, days: int = 90) -> go.Figure:
-    hist = fetch_symbol_history(symbol, days=days)
+    hist, _src, _note = fetch_history_ondemand(symbol, days=days)
     if hist.empty:
         return go.Figure()
     closes = _to_series(hist, "Close")
@@ -2006,7 +2072,7 @@ def create_price_chart(symbol: str, signal_row: Optional[pd.Series] = None, days
                               annotation_text=f"{label} ${val:.2f}", annotation_position="right")
 
     fig.update_layout(
-        title=f"{symbol} — Price & Signals",
+        title=f"{symbol} — Price & Signals · {_src}",
         xaxis_title="Date", yaxis_title="Price ($)",
         hovermode="x unified", height=450,
     )
@@ -2017,7 +2083,7 @@ def create_setup_chart(symbol: str, row, days: int = 180) -> go.Figure:
     """Price chart for a Setup Scanner hit, overlaid with the structure that drove it:
     unmitigated Fair-Value-Gap zones, any double-bottom level/neckline, and the entry/stop/target.
     """
-    hist = fetch_symbol_history(symbol, days=days)
+    hist, _src, _note = fetch_history_ondemand(symbol, days=days)
     if hist.empty:
         return go.Figure()
     closes = _to_series(hist, "Close")
@@ -2068,7 +2134,7 @@ def create_setup_chart(symbol: str, row, days: int = 180) -> go.Figure:
                           annotation_text=f"{label} ${val:.2f}", annotation_position="right")
 
     setup_name = row.get("setup", "") if hasattr(row, "get") else ""
-    fig.update_layout(title=f"{symbol} — {setup_name}".rstrip(" —"),
+    fig.update_layout(title=f"{symbol} — {setup_name} · {_src}".replace(" —  · ", " · "),
                       xaxis_title="Date", yaxis_title="Price ($)",
                       hovermode="x unified", height=460)
     return fig
@@ -2216,6 +2282,13 @@ def run_dashboard() -> None:
         st.divider()
         account_size = float(st.number_input("Account size ($)", value=100_000, step=10_000,
                                              min_value=1000))
+        # Free-tier API budget status — only shown for providers you've enabled.
+        for _pk, _spec in PROVIDERS.items():
+            if _provider_on(_pk) and _spec.per_minute:
+                _stt = get_api_budget().status(_pk)
+                _used = int(_stt.get("used_minute", 0))
+                _dot = "🟢" if _used < 0.8 * _spec.per_minute else ("🟡" if _used < _spec.per_minute else "🔴")
+                st.caption(f"{_dot} {_spec.name}: {_used}/{_spec.per_minute} calls/min")
 
     # ═══════════════════════ SCREENER ════════════════════════════════════════
     if page == "Screener":
@@ -5017,6 +5090,44 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
                     pass
                 get_ml_signal_model.clear()
                 st.success("Cleared — the model retrains on the next Screener scan.")
+
+        st.subheader("Data & APIs")
+        st.caption("Add free-tier API keys to bring in extra data sources. Usage is **hard-capped** "
+                   "to each provider's free limit — when you reach it, screens automatically fall "
+                   "back to free Yahoo data, so you're **never charged**. Keys are stored in the "
+                   "gitignored `.env`.")
+        _budget = get_api_budget()
+        for _pk, _spec in PROVIDERS.items():
+            with st.container(border=True):
+                st.markdown(f"**{_spec.name}** — best for {_spec.recommended_use}  ·  "
+                            f"[plan & limits]({_spec.docs_url})")
+                _has_key = bool(_polygon_key()) if _pk == "polygon" else bool(
+                    st.session_state.get(f"{_pk}_api_key"))
+                _new = st.text_input(f"{_spec.name} API key", value="", type="password",
+                                     placeholder=("✓ key on file — paste a new one to replace"
+                                                  if _has_key else "paste your key…"),
+                                     key=f"{_pk}_api_key_input")
+                if _new.strip():
+                    st.session_state[f"{_pk}_api_key"] = _new.strip()
+                    _persist_env(_spec.env_var, _new.strip())
+                    _has_key = True
+                    st.success(f"{_spec.name} key saved to .env.")
+                st.session_state[f"use_{_pk}"] = st.checkbox(
+                    f"Use {_spec.name} for single-symbol lookups", value=_provider_on(_pk),
+                    disabled=not _has_key, key=f"use_{_pk}_box",
+                    help="Drill-down charts & one-ticker lookups use this provider within its free "
+                         "limit; bulk scans always stay on free Yahoo data.")
+                # Live usage meters.
+                _stt = _budget.status(_pk)
+                if _spec.per_minute:
+                    _used = int(_stt.get("used_minute", 0))
+                    st.progress(min(_used / _spec.per_minute, 1.0),
+                                text=f"{_used}/{_spec.per_minute} calls this minute")
+                    if _used >= _spec.per_minute:
+                        st.error(f"Minute limit reached — resets in ~{int(_stt.get('reset_in_s', 0))}s. "
+                                 "Falling back to free data.")
+                    elif _used >= 0.8 * _spec.per_minute:
+                        st.warning(f"Near the minute limit ({_used}/{_spec.per_minute}).")
 
         st.subheader("Cache Management")
         if st.button("Clear all caches"):
