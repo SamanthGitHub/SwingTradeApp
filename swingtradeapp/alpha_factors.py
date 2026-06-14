@@ -76,12 +76,52 @@ def realized_vol(px: pd.DataFrame, window: int = 21) -> pd.DataFrame:
     return px.pct_change().rolling(window).std() * np.sqrt(TRADING_DAYS)
 
 
+# ── Residual (market-neutral) factors ────────────────────────────────────────────
+# These regress out the *universe's own equal-weight return* (a free, self-contained "market"),
+# leaving the stock-specific component — so the factor isn't just re-betting on market direction.
+
+def _residual_returns(px: pd.DataFrame, beta_window: int = 120) -> pd.DataFrame:
+    """Daily returns with each name's rolling market beta (vs the equal-weight universe) removed."""
+    rets = px.pct_change()
+    mkt = rets.mean(axis=1)
+    rm = mkt.rolling(beta_window).mean()
+    vm = mkt.rolling(beta_window).var()
+    cov = (rets.mul(mkt, axis=0).rolling(beta_window).mean()
+           .sub(rets.rolling(beta_window).mean().mul(rm, axis=0)))
+    beta = cov.div(vm, axis=0)
+    return rets.sub(beta.mul(mkt, axis=0))
+
+
+def residual_momentum(px: pd.DataFrame, lookback: int = TRADING_DAYS, skip: int = 21,
+                      beta_window: int = 120) -> pd.DataFrame:
+    """12-1 momentum of *residual* (market-neutral) returns — higher Sharpe, fewer crashes than raw."""
+    resid = _residual_returns(px, beta_window)
+    return resid.rolling(lookback - skip).sum().shift(skip)
+
+
+def idiosyncratic_vol(px: pd.DataFrame, window: int = 126, beta_window: int = 120) -> pd.DataFrame:
+    """The idio-vol anomaly: *negative* annualised vol of residual returns (low idio-vol scores high)."""
+    resid = _residual_returns(px, beta_window)
+    return -(resid.rolling(window).std() * np.sqrt(TRADING_DAYS))
+
+
 # Default factor set and weights. Signs are already baked into the factors (all "higher = long").
 DEFAULT_FACTORS = {
     "momentum": (momentum, 0.35),
     "trend": (trend, 0.25),
     "high_proximity": (high_proximity, 0.15),
     "low_volatility": (low_volatility, 0.15),
+    "reversal": (reversal, 0.10),
+}
+
+# Enhanced set: the core five plus the two market-neutral factors. Same total weight.
+ENHANCED_FACTORS = {
+    "momentum": (momentum, 0.18),
+    "residual_momentum": (residual_momentum, 0.22),
+    "trend": (trend, 0.18),
+    "high_proximity": (high_proximity, 0.12),
+    "low_volatility": (low_volatility, 0.10),
+    "idiosyncratic_vol": (idiosyncratic_vol, 0.10),
     "reversal": (reversal, 0.10),
 }
 
