@@ -131,6 +131,26 @@ class VectorBacktestEngine:
 
         return self._simulate(closes, highs, lows, signals)
 
+    def run_signals(
+        self,
+        closes: np.ndarray,
+        highs: np.ndarray,
+        lows: np.ndarray,
+        signals: List[Dict[str, Any]],
+    ) -> BacktestResult:
+        """Backtest an explicit list of signal dicts ``{bar, entry, stop, target, symbol}``.
+
+        Unlike :meth:`run` (which overwrites every signal's exits with a uniform ATR bracket),
+        this honours each signal's *own* stop/target — used by the Setup Backtest Lab so a
+        setup is validated under the exit rules it actually defines. Signals whose levels are
+        invalid (stop ≥ entry or target ≤ entry) are skipped by the simulator.
+        """
+        if len(closes) < 5 or not signals:
+            return BacktestResult.empty()
+        return self._simulate(np.asarray(closes, dtype=float),
+                              np.asarray(highs, dtype=float),
+                              np.asarray(lows, dtype=float), signals)
+
     def run_walk_forward(
         self,
         closes: np.ndarray,

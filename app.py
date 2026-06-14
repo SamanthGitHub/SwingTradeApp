@@ -40,6 +40,7 @@ from swingtradeapp import ui
 from swingtradeapp import youtube as yt
 from swingtradeapp import alpha_engine, alpha_factors, alpha_ml, alpha_validation, datalake
 from swingtradeapp import confluence as cf
+from swingtradeapp import patterns as patterns_mod, setups as setups_mod, regime as regime_mod
 from swingtradeapp import analysis_guide as ag
 from swingtradeapp import insiders as ins
 from swingtradeapp.universe import PreMarketScanner, UniverseFilter
@@ -511,6 +512,8 @@ def _limit_note(entry, current) -> str:
 RECOMMENDED_TIMES: Dict[str, str] = {
     "Screener": "After 9:45 AM ET (let the open settle) — or after the close to plan tomorrow",
     "Rally Radar": "After the close (completed daily bars) — or 9:45 AM+ once the open settles",
+    "Setup Scanner": "After the close (completed daily bars) — or 9:45 AM+ once the open settles",
+    "Backtest Lab": "Any time — it runs on completed historical daily bars",
     "Signal Stack": "After the close, or 9:45 AM+ once the open settles",
     "ETF Screener": "After the close (daily bars) — or anytime",
     "Pre-Market Movers": "8:00–9:15 AM ET (after the 8:30 econ data)",
@@ -706,6 +709,131 @@ def scan_rally_radar(sample_size: int = 150, min_score: float = 45.0) -> pd.Data
     if not df.empty:
         df = df.sort_values("rally_score", ascending=False).reset_index(drop=True)
     return df
+
+
+# ── Setup Scanner / Backtest Lab / Market Regime helpers ─────────────────────────
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_regime_read():
+    """Current market-regime verdict (Trade / Caution / Stand-aside) — cached 10 min.
+
+    Combines SPY vs its 200-SMA (+ slope), market breadth and VIX via ``regime.assess_regime``.
+    Used to gate the Setup Scanner and surfaced on the Market Regime page.
+    """
+    spy = fetch_symbol_history("SPY", days=400)
+    closes = _to_series(spy, "Close") if not spy.empty else []
+    macro = get_macro_context()
+    try:
+        vix = macro.fetch_vix()
+    except Exception:
+        vix = None
+    breadth = None
+    try:
+        b = macro.fetch_market_breadth()
+        breadth = b.get("bullish_breadth_pct") if b else None
+    except Exception:
+        breadth = None
+    return regime_mod.assess_regime(closes, vix=vix, breadth_pct=breadth)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def scan_setups(sample_size: int = 150) -> pd.DataFrame:
+    """Scan the most-active universe for every named setup (cached 10 min).
+
+    For each symbol runs ``setups.detect_all`` (VCP, 20-EMA pullback, double bottom, liquidity
+    sweep, RSI(2)) on ~1y of daily bars and records each hit with its entry/stop/target/R:R, a
+    quality score, a Fair-Value-Gap confluence tag and the reasons it fired.
+    """
+    universe = get_screen_universe()[:sample_size]
+    rows: List[Dict] = []
+    for sym in universe:
+        hist = fetch_symbol_history(sym, days=400)
+        if hist.empty or len(hist) < 60 or "Volume" not in hist.columns:
+            continue
+        closes = _to_series(hist, "Close")
+        opens = _to_series(hist, "Open") if "Open" in hist.columns else closes
+        highs = _to_series(hist, "High") if "High" in hist.columns else closes
+        lows = _to_series(hist, "Low") if "Low" in hist.columns else closes
+        vols = _to_series(hist, "Volume")
+        try:
+            hits = setups_mod.detect_all(opens, highs, lows, closes, vols)
+        except Exception:
+            continue
+        if not hits:
+            continue
+        fvg = setups_mod.fvg_confluence(highs, lows, closes)
+        price = float(closes[-1])
+        for hit in hits:
+            tags = list(hit.tags) + ([fvg] if fvg else [])
+            rows.append({
+                "symbol": sym, "setup": hit.name, "score": float(hit.score),
+                "price": price, "entry": hit.entry, "stop": hit.stop,
+                "target": hit.target, "rr": float(hit.risk_reward),
+                "tags": ", ".join(tags), "why": " · ".join(hit.reasons),
+            })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("score", ascending=False).reset_index(drop=True)
+    return df
+
+
+def run_setup_backtest(setup_name: str, symbols: List[str]) -> Dict:
+    """Backtest one setup across ``symbols`` on causal historical bars, honouring the setup's own
+    stop/target. Pools trades and returns honest edge stats (expectancy in R, profit factor,
+    win rate, Sharpe, max drawdown). Used by the Backtest Lab.
+    """
+    engine = get_backtest_engine(get_config())
+    setup = setups_mod.SETUP_BY_NAME.get(setup_name)
+    trades = []  # TradeRecord list pooled across symbols
+    n_symbols = 0
+    for sym in symbols:
+        hist = fetch_symbol_history(sym, days=800)
+        if hist.empty or len(hist) < setup.min_bars + 12 or "Volume" not in hist.columns:
+            continue
+        closes = np.array(_to_series(hist, "Close"), dtype=float)
+        opens = np.array(_to_series(hist, "Open") if "Open" in hist.columns else closes, dtype=float)
+        highs = np.array(_to_series(hist, "High") if "High" in hist.columns else closes, dtype=float)
+        lows = np.array(_to_series(hist, "Low") if "Low" in hist.columns else closes, dtype=float)
+        vols = np.array(_to_series(hist, "Volume"), dtype=float)
+        try:
+            hits = setup.signal_bars(opens, highs, lows, closes, vols)
+        except Exception:
+            continue
+        if not hits:
+            continue
+        sigs = [{"bar": hh.bar, "entry": hh.entry, "stop": hh.stop,
+                 "target": hh.target, "symbol": sym} for hh in hits]
+        res = engine.run_signals(closes, highs, lows, sigs)
+        trades.extend(res.trades)
+        n_symbols += 1
+
+    if not trades:
+        return {"trades": [], "n": 0, "n_symbols": n_symbols}
+
+    pnls = np.array([t.pnl_pct for t in trades], dtype=float)
+    wins = pnls[pnls > 0]
+    losses = pnls[pnls <= 0]
+    rs = [t.pnl_pct / ((t.entry_price - t.stop_price) / t.entry_price)
+          for t in trades if (t.entry_price - t.stop_price) > 0]
+    eq = np.cumprod(1 + pnls)
+    peak = np.maximum.accumulate(np.concatenate([[1.0], eq]))
+    dd = (peak - np.concatenate([[1.0], eq])) / peak
+    gross_win = float(wins.sum())
+    gross_loss = float(abs(losses.sum()))
+    return {
+        "trades": trades,
+        "n": len(trades),
+        "n_symbols": n_symbols,
+        "win_rate": float((pnls > 0).mean()),
+        "expectancy_r": float(np.mean(rs)) if rs else 0.0,
+        "avg_win": float(wins.mean()) if len(wins) else 0.0,
+        "avg_loss": float(losses.mean()) if len(losses) else 0.0,
+        "profit_factor": (gross_win / gross_loss) if gross_loss > 0 else float("inf"),
+        "sharpe": float((pnls.mean() / pnls.std(ddof=1)) * np.sqrt(252)) if len(pnls) > 1 and pnls.std(ddof=1) > 0 else 0.0,
+        "max_dd": float(dd.max()),
+        "total_return": float(eq[-1] - 1.0),
+        "equity": eq.tolist(),
+    }
 
 
 # ETF categories sourced from ETFScreener (single source of truth).
@@ -1882,6 +2010,67 @@ def create_price_chart(symbol: str, signal_row: Optional[pd.Series] = None, days
         xaxis_title="Date", yaxis_title="Price ($)",
         hovermode="x unified", height=450,
     )
+    return fig
+
+
+def create_setup_chart(symbol: str, row, days: int = 180) -> go.Figure:
+    """Price chart for a Setup Scanner hit, overlaid with the structure that drove it:
+    unmitigated Fair-Value-Gap zones, any double-bottom level/neckline, and the entry/stop/target.
+    """
+    hist = fetch_symbol_history(symbol, days=days)
+    if hist.empty:
+        return go.Figure()
+    closes = _to_series(hist, "Close")
+    highs = _to_series(hist, "High") if "High" in hist.columns else closes
+    lows = _to_series(hist, "Low") if "Low" in hist.columns else closes
+    dates = hist.index
+    sma20 = pd.Series(closes).rolling(20).mean()
+    sma50 = pd.Series(closes).rolling(50).mean()
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=dates, y=closes, mode="lines", name="Close",
+                             line=dict(color="#1f77b4", width=2)))
+    fig.add_trace(go.Scatter(x=dates, y=sma20, mode="lines", name="SMA 20",
+                             line=dict(color="orange", width=1, dash="dash")))
+    fig.add_trace(go.Scatter(x=dates, y=sma50, mode="lines", name="SMA 50",
+                             line=dict(color="red", width=1, dash="dash")))
+
+    # Unmitigated Fair-Value-Gap zones (institutional defence zones), most recent few.
+    try:
+        zones = [z for z in patterns_mod.detect_fair_value_gaps(highs, lows, closes)
+                 if not z.mitigated and not z.inverted][-8:]
+        for z in zones:
+            color = "rgba(0,200,81,0.10)" if z.kind == "bullish" else "rgba(255,68,68,0.10)"
+            fig.add_hrect(y0=z.bottom, y1=z.top, fillcolor=color, line_width=0, layer="below")
+    except Exception:
+        pass
+
+    # Double-bottom support + neckline if present.
+    try:
+        dp = patterns_mod.detect_double_bottom(highs, lows)
+        if dp is not None:
+            fig.add_hline(y=dp.level, line_color="#9467bd", line_dash="dot",
+                          annotation_text=f"DB support ${dp.level:.2f}", annotation_position="left")
+            fig.add_hline(y=dp.neckline, line_color="#9467bd", line_dash="dash",
+                          annotation_text=f"Neckline ${dp.neckline:.2f}", annotation_position="left")
+    except Exception:
+        pass
+
+    # Entry / stop / target from the hit.
+    for level, color, label in [("entry", "green", "Entry"), ("stop", "red", "Stop"),
+                                ("target", "blue", "Target")]:
+        try:
+            val = float(row.get(level))
+        except (TypeError, ValueError):
+            val = None
+        if val:
+            fig.add_hline(y=val, line_color=color, line_dash="dot",
+                          annotation_text=f"{label} ${val:.2f}", annotation_position="right")
+
+    setup_name = row.get("setup", "") if hasattr(row, "get") else ""
+    fig.update_layout(title=f"{symbol} — {setup_name}".rstrip(" —"),
+                      xaxis_title="Date", yaxis_title="Price ($)",
+                      hovermode="x unified", height=460)
     return fig
 
 
@@ -4544,6 +4733,214 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
                                    file_name=f"insider_{isym}.csv", mime="text/csv")
         else:
             st.info("Enter a ticker and press **Look up** to see its insider filings.")
+
+    # ═══════════════════════ SETUP SCANNER ═══════════════════════════════════
+    elif page == "Setup Scanner":
+        st.header("🧭 Setup Scanner")
+        st.caption("Named, research-backed swing setups — **VCP breakout**, **20-EMA pullback**, "
+                   "**double bottom**, **liquidity sweep (Turtle Soup)** and **RSI(2) reversion** "
+                   "— each with a concrete entry / stop / target and the reasons it fired. Long "
+                   "ideas are gated by the market regime. Educational, not financial advice.")
+        _render_legend()
+
+        reg = get_regime_read()
+        badge = {"Trade": "🟢", "Caution": "🟡", "Stand-aside": "🔴"}.get(reg.verdict, "⚪")
+        gate_msg = (f"{badge} **Market regime: {reg.verdict}** ({reg.score}/100) — "
+                    f"{', '.join(reg.drivers)}. ")
+        gate_msg += ("Long setups are sanctioned." if reg.allows_long
+                     else "Regime says **stand aside** — setups below are for study only.")
+        (st.success if reg.verdict == "Trade" else st.warning if reg.verdict == "Caution"
+         else st.error)(gate_msg)
+
+        ssc1, ssc2 = st.columns([1, 2])
+        with ssc1:
+            ss_n = st.slider("Universe size", 40, 250, 150, 10,
+                             help="Most-active names are scanned first")
+        with ssc2:
+            all_names = [s.name for s in setups_mod.ALL_SETUPS]
+            ss_pick = st.multiselect("Setups to show", all_names, default=all_names)
+
+        if not scan_gate("setupscanner", RECOMMENDED_TIMES["Setup Scanner"], clear=scan_setups.clear):
+            st.stop()
+        with st.spinner("Scanning for setups…"):
+            sdf = scan_setups(sample_size=ss_n)
+
+        if sdf.empty:
+            st.info("No setups cleared the rules right now. Widen the universe, or wait for the "
+                    "tape to set up — clean trends and quiet ranges simply produce fewer triggers.")
+        else:
+            view = sdf[sdf["setup"].isin(ss_pick)].copy() if ss_pick else sdf.copy()
+            if view.empty:
+                st.info("No hits for the selected setups — try selecting more.")
+            else:
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Setups found", len(view))
+                m2.metric("Unique symbols", view["symbol"].nunique())
+                m3.metric("Avg R:R", f"{view['rr'].mean():.2f}")
+
+                sizer = get_sizer(config)
+
+                def _alloc_pct(r) -> float:
+                    sig = SimpleNamespace(score=float(r["score"]), signal_type="long",
+                                          entry_price=float(r["entry"]), stop_price=float(r["stop"]),
+                                          target_price=float(r["target"]))
+                    try:
+                        return sizer.size_position(sig, account_size=account_size).fraction * 100.0
+                    except Exception:
+                        return 0.0
+
+                view["Reco"] = view["score"].map(lambda s: recommend_label(s, "long"))
+                view["Alloc %"] = view.apply(_alloc_pct, axis=1)
+
+                disp = view.rename(columns={
+                    "symbol": "Symbol", "setup": "Setup", "price": "Price", "entry": "Entry",
+                    "stop": "Stop", "target": "Target", "rr": "R:R", "tags": "Tags", "why": "Why",
+                })[["Symbol", "Setup", "Reco", "Price", "Entry", "Stop", "Target", "R:R",
+                    "Alloc %", "Tags", "Why"]]
+
+                st.dataframe(
+                    disp.style.format({
+                        "Price": "${:.2f}", "Entry": "${:.2f}", "Stop": "${:.2f}",
+                        "Target": "${:.2f}", "R:R": "{:.2f}", "Alloc %": "{:.2f}%",
+                    }, na_rep="—").map(_reco_color, subset=["Reco"]),
+                    use_container_width=True, height=480, hide_index=True,
+                )
+                st.download_button("Download CSV", view.to_csv(index=False),
+                                   file_name=f"setups_{datetime.now():%Y%m%d_%H%M}.csv",
+                                   mime="text/csv")
+
+                # Drill-down chart with pattern overlays.
+                labels = [f"{r.symbol} · {r.setup}" for r in view.itertuples()]
+                pick = st.selectbox("Inspect a setup", labels)
+                sel_row = view.iloc[labels.index(pick)]
+                st.plotly_chart(create_setup_chart(sel_row["symbol"], sel_row),
+                                use_container_width=True,
+                                key=f"setup_chart_{sel_row['symbol']}_{sel_row['setup']}")
+                note = _limit_note(sel_row["entry"], sel_row["price"])
+                if note:
+                    st.caption(note)
+                st.caption(f"**Why:** {sel_row['why']}")
+
+    # ═══════════════════════ BACKTEST LAB ════════════════════════════════════
+    elif page == "Backtest Lab":
+        st.header("🧪 Backtest Lab")
+        st.caption("Validate a setup **honestly**: a high win rate alone is not an edge — "
+                   "**expectancy** (average R per trade) and **profit factor** are. Trades are "
+                   "simulated net of costs on completed daily bars; entries are causal (no "
+                   "lookahead) and use each setup's own stop/target.")
+
+        bl1, bl2 = st.columns([2, 1])
+        with bl1:
+            bl_setup = st.selectbox("Setup", [s.name for s in setups_mod.ALL_SETUPS])
+        with bl2:
+            bl_mode = st.radio("Scope", ["Single symbol", "Universe sample"], index=1)
+
+        if bl_mode == "Single symbol":
+            bl_sym = st.text_input("Symbol", "AAPL").strip().upper()
+            bl_symbols = [bl_sym] if bl_sym else []
+        else:
+            bl_k = st.slider("Sample size (most-active names)", 10, 120, 40, 10)
+            bl_symbols = get_screen_universe()[:bl_k]
+
+        s_obj = setups_mod.SETUP_BY_NAME.get(bl_setup)
+        if s_obj is not None and isinstance(s_obj, setups_mod.RSI2Setup):
+            st.caption("⚠️ RSI(2) exits are condition-based (RSI>70 / close back above the 5-EMA); "
+                       "here they're approximated by a tight bracket, so results are indicative.")
+
+        if st.button("▶ Run backtest", type="primary", key="run_bt"):
+            with st.spinner(f"Backtesting {bl_setup} across {len(bl_symbols)} symbol(s)…"):
+                res = run_setup_backtest(bl_setup, bl_symbols)
+            st.session_state["_bt_result"] = res
+            st.session_state["_bt_label"] = f"{bl_setup} · {len(bl_symbols)} symbol(s)"
+
+        res = st.session_state.get("_bt_result")
+        if not res:
+            st.info("Pick a setup and scope, then press **▶ Run backtest**.")
+        elif res["n"] == 0:
+            st.warning(f"No trades triggered for **{bl_setup}** on {res['n_symbols']} symbol(s) "
+                       "with data. Try a larger sample or a different setup.")
+        else:
+            st.caption(f"**{st.session_state.get('_bt_label', '')}** · "
+                       f"{res['n']} trades across {res['n_symbols']} symbols")
+            e_color = "normal" if res["expectancy_r"] >= 0 else "inverse"
+            r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+            r1c1.metric("Expectancy", f"{res['expectancy_r']:+.2f} R",
+                        help="Avg profit per trade in units of risk. >0 = a positive edge.")
+            r1c2.metric("Profit factor", f"{res['profit_factor']:.2f}",
+                        help="Gross win ÷ gross loss. >1 = profitable.")
+            r1c3.metric("Win rate", f"{res['win_rate']*100:.2f}%")
+            r1c4.metric("Trades", res["n"])
+            r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+            r2c1.metric("Avg win", f"{res['avg_win']*100:+.2f}%")
+            r2c2.metric("Avg loss", f"{res['avg_loss']*100:+.2f}%")
+            r2c3.metric("Sharpe", f"{res['sharpe']:.2f}")
+            r2c4.metric("Max drawdown", f"{res['max_dd']*100:.2f}%")
+
+            verdict = ("✅ Positive expectancy — a real edge in this sample."
+                       if res["expectancy_r"] > 0 and res["profit_factor"] > 1
+                       else "⚠️ Negative/zero expectancy — win rate alone is misleading here.")
+            (st.success if "✅" in verdict else st.warning)(verdict)
+
+            eq = res.get("equity", [])
+            if eq:
+                fig = go.Figure(go.Scatter(y=eq, mode="lines", line=dict(color="#00c851", width=2),
+                                           name="Equity (×)"))
+                fig.update_layout(title="Equity curve (1.0 = start, trades chained)",
+                                  xaxis_title="Trade #", yaxis_title="Equity (×)", height=320)
+                st.plotly_chart(fig, use_container_width=True, key=f"bt_equity_{bl_setup}")
+
+            trades = res["trades"]
+            tdf = pd.DataFrame([{
+                "Symbol": t.symbol, "Entry $": round(t.entry_price, 2),
+                "Exit $": round(t.exit_price, 2), "Stop $": round(t.stop_price, 2),
+                "Target $": round(t.target_price, 2), "P&L %": t.pnl_pct * 100.0,
+                "Won": "✅" if t.won else "❌",
+            } for t in trades[-60:]])
+            st.dataframe(tdf.style.format({"P&L %": "{:+.2f}%"}, na_rep="—")
+                         .map(_hl_pct, subset=["P&L %"]),
+                         use_container_width=True, height=360, hide_index=True)
+            st.caption("Showing up to the last 60 trades. Costs (slippage + commission) are applied "
+                       "to every fill via the Settings cost model.")
+
+    # ═══════════════════════ MARKET REGIME ═══════════════════════════════════
+    elif page == "Market Regime":
+        st.header("🌡️ Market Regime")
+        st.caption("Should you be taking new long setups at all? This is the daily-bias gate the "
+                   "research insists on (SPY vs its 200-SMA + slope, breadth, VIX) — plus weekday "
+                   "seasonality (the Tue/Wed/Thu/Fri edges). Auto-runs; cached 10 min.")
+
+        reg = get_regime_read()
+        banner = {"Trade": "🟢 TRADE", "Caution": "🟡 CAUTION", "Stand-aside": "🔴 STAND ASIDE"}.get(reg.verdict, reg.verdict)
+        verdict_fn = (st.success if reg.verdict == "Trade" else
+                      st.warning if reg.verdict == "Caution" else st.error)
+        verdict_fn(f"### {banner} — risk-on score {reg.score}/100\n\n" + " · ".join(reg.drivers))
+
+        g1, g2, g3 = st.columns(3)
+        g1.metric("SPY vs 200-SMA", "Above ✅" if reg.spy_above_200 else "Below ❌")
+        g2.metric("Market breadth",
+                  f"{reg.breadth_pct*100:.0f}%" if reg.breadth_pct is not None else "—",
+                  help="Share of recent SPY closes above the 200-day SMA")
+        g3.metric("VIX", f"{reg.vix:.1f}" if reg.vix is not None else "—")
+
+        st.divider()
+        st.subheader("Weekday seasonality")
+        ws_sym = st.text_input("Symbol", "SPY", key="regime_sym").strip().upper() or "SPY"
+        wsh = fetch_symbol_history(ws_sym, days=800)
+        if wsh.empty or "Open" not in wsh.columns:
+            st.info(f"No daily history for **{ws_sym}**.")
+        else:
+            ws = regime_mod.weekday_seasonality(
+                wsh.index, _to_series(wsh, "Open"), _to_series(wsh, "High"),
+                _to_series(wsh, "Low"), _to_series(wsh, "Close"))
+            st.dataframe(
+                ws.style.format({"Up day %": "{:.2f}%", "Avg return %": "{:+.2f}%",
+                                 "Gap-fill %": "{:.2f}%"}, na_rep="—")
+                  .map(_hl_pct, subset=["Avg return %"]),
+                use_container_width=True,
+            )
+            st.caption(f"Over {int(ws['Days'].sum())} trading days. **Up day %** = close > prior "
+                       "close · **Gap-fill %** = the overnight gap traded back through the prior "
+                       "close intraday. Patterns drift — treat as context, not a guarantee.")
 
     elif page == "Settings":
         st.header("Settings")

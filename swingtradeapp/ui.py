@@ -31,6 +31,8 @@ NAV_ITEMS: List[Tuple[str, str, str]] = [
     ("Screener", "graph-up", "📈"),
     ("Morning Insights", "sun", "☀️"),  # auto-runs (no Scan button) — pre-open briefing
     ("Rally Radar", "rocket-takeoff", "🚀"),  # early / pre-breakout momentum-ignition setups
+    ("Setup Scanner", "ui-checks-grid", "🧭"),  # named research-backed setups w/ entry/stop/target
+    ("Backtest Lab", "clipboard-data", "🧪"),  # validate any setup on expectancy, not win rate
     ("Signal Stack", "layers", "🧩"),  # synthesis of the other screens
     ("Alpha Engine", "cpu", "🧠"),  # cross-sectional factor book + lookahead-free backtest
     ("ETF Screener", "grid-3x3-gap", "🗂️"),
@@ -39,6 +41,7 @@ NAV_ITEMS: List[Tuple[str, str, str]] = [
     ("Pre-Market Movers", "sunrise", "🌅"),
     ("Live Movers", "lightning-charge", "⚡"),
     ("After-Hours & IPOs", "moon-stars", "🌙"),
+    ("Market Regime", "thermometer-half", "🌡️"),  # daily-bias gate + weekday seasonality
     ("Heat Map", "fire", "🔥"),
     # Deeper signals & forecasts
     ("Whale Movements", "water", "🐋"),
