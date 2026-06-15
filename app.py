@@ -2082,6 +2082,18 @@ def render_alpha_simple_plan(res, account, m, bm, dsr, pbo, reasons=None) -> Non
 
 # ── Chart helpers ──────────────────────────────────────────────────────────────
 
+def _source_badge(fig: go.Figure, source: str, note: Optional[str] = None) -> None:
+    """Stamp a visible data-source badge on a chart so paid (Polygon) vs free (Yahoo) is obvious
+    at a glance — green 📡 for Polygon, grey 🆓 for Yahoo."""
+    is_polygon = "Polygon" in (source or "")
+    txt = (f"📡 Data: {source}" if is_polygon else f"🆓 Data: {source}")
+    if note:
+        txt += f"  ·  {note}"
+    fig.add_annotation(xref="paper", yref="paper", x=0.005, y=0.99, xanchor="left", yanchor="top",
+                       showarrow=False, text=txt, font=dict(size=12, color="#ffffff"),
+                       bgcolor=("#00a843" if is_polygon else "#5a5a5a"), borderpad=4, opacity=0.93)
+
+
 def create_price_chart(symbol: str, signal_row: Optional[pd.Series] = None, days: int = 90) -> go.Figure:
     hist, _src, _note = fetch_history_ondemand(symbol, days=days)
     if hist.empty:
@@ -2116,6 +2128,7 @@ def create_price_chart(symbol: str, signal_row: Optional[pd.Series] = None, days
         xaxis_title="Date", yaxis_title="Price ($)",
         hovermode="x unified", height=450,
     )
+    _source_badge(fig, _src, _note)
     return fig
 
 
@@ -2177,6 +2190,7 @@ def create_setup_chart(symbol: str, row, days: int = 180) -> go.Figure:
     fig.update_layout(title=f"{symbol} — {setup_name} · {_src}".replace(" —  · ", " · "),
                       xaxis_title="Date", yaxis_title="Price ($)",
                       hovermode="x unified", height=460)
+    _source_badge(fig, _src, _note)
     return fig
 
 
