@@ -148,8 +148,20 @@ def _ai_on(key: str) -> bool:
 
 # ── Data helpers ───────────────────────────────────────────────────────────────
 
+# Wall-clock of the most recent *actual* market-data pull (set only on a real fetch, not a cache
+# hit) + which source served it. Drives the "last live pull" stamp in the data-status strip so the
+# user can see how fresh the data is. Plain module global (process-wide; no Streamlit cache warning).
+_LAST_CAPTURE: Dict[str, object] = {"at": None, "source": None}
+
+
+def _mark_capture(source: str) -> None:
+    _LAST_CAPTURE["at"] = datetime.now()
+    _LAST_CAPTURE["source"] = source
+
+
 @with_retry()
 def _yf_download(symbol: str, start, end) -> pd.DataFrame:
+    _mark_capture("Yahoo · free")
     return yf.download(symbol, start=start, end=end, progress=False, threads=False)
 
 
@@ -186,11 +198,39 @@ def fetch_history_ondemand(symbol: str, days: int = 90):
         if allowed:
             df = get_polygon_provider().fetch_daily_bars(symbol, days=days)
             if df is not None and not df.empty:
+                _mark_capture("Polygon · Massive")
                 return df, "Polygon · Massive", None
             return fetch_symbol_history(symbol, days=days), "Yahoo · free", None
         return (fetch_symbol_history(symbol, days=days), "Yahoo · free",
                 f"Polygon {reason} reached — using free data.")
     return fetch_symbol_history(symbol, days=days), "Yahoo · free", None
+
+
+def _now_et() -> datetime:
+    """Current time in US/Eastern (market time) — falls back to local if zoneinfo is unavailable."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        return datetime.now()
+
+
+def render_data_status() -> None:
+    """One-line strip shown at the top of every screen: the refresh time, whether any PAID
+    (Polygon) data is in use, and when live market data was last actually pulled."""
+    now = _now_et()
+    polygon_live = _provider_on("polygon") and bool(_polygon_key())
+    if polygon_live:
+        stt = get_api_budget().status("polygon")
+        used, lim = int(stt.get("used_minute", 0)), int(stt.get("per_minute", 5) or 5)
+        icon = "🟢" if used < lim else "🔴"
+        src = f"{icon} Yahoo · free **+ Polygon · Massive** on single-symbol ({used}/{lim} this min)"
+    else:
+        src = "🆓 Yahoo Finance · free (no paid data in use)"
+    cap = _LAST_CAPTURE.get("at")
+    cap_txt = (f" · live data last pulled **{cap:%I:%M:%S %p}** ({_LAST_CAPTURE.get('source')})"
+               if isinstance(cap, datetime) else " · data loads on a screen's Scan / Re-scan")
+    st.caption(f"🕒 As of **{now:%a %b %d, %Y · %I:%M %p}** ET  ·  Data: {src}{cap_txt}")
 
 
 def _persist_env(key: str, value: str) -> None:
@@ -2289,6 +2329,9 @@ def run_dashboard() -> None:
                 _used = int(_stt.get("used_minute", 0))
                 _dot = "🟢" if _used < 0.8 * _spec.per_minute else ("🟡" if _used < _spec.per_minute else "🔴")
                 st.caption(f"{_dot} {_spec.name}: {_used}/{_spec.per_minute} calls/min")
+
+    # Data-source + timestamp strip on every screen (free vs paid, and data freshness).
+    render_data_status()
 
     # ═══════════════════════ SCREENER ════════════════════════════════════════
     if page == "Screener":
