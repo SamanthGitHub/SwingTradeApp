@@ -106,8 +106,14 @@ def get_polygon_provider() -> PolygonProvider:
 
 
 def _provider_on(key: str) -> bool:
-    """Whether a data provider is enabled via its Settings → Data & APIs toggle."""
-    return bool(st.session_state.get(f"use_{key}", False))
+    """Whether a data provider is enabled. Defaults **ON** when a key is configured (you added the
+    key to use it); an explicit Settings → Data & APIs toggle always overrides the default."""
+    flag = f"use_{key}"
+    if flag in st.session_state:
+        return bool(st.session_state[flag])
+    if key == "polygon":
+        return bool(_polygon_key())
+    return False
 
 @st.cache_resource
 def get_options_analyzer():
