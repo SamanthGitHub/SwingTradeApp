@@ -18,6 +18,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Optional
 
+from .num import clip01 as _clip01
+
 # Display/iteration order and relative trust of each signal.
 SIGNAL_ORDER = ["tech", "whale", "forecast", "options", "news", "social", "sector"]
 N_SIGNALS = len(SIGNAL_ORDER)  # coverage denominator (total signals the app can provide)
@@ -38,14 +40,6 @@ class Vote:
     dir: int            # +1 bullish, 0 neutral, -1 bearish
     strength: float     # 0..1 confidence/magnitude
     detail: str = ""
-
-
-def _clip01(x) -> float:
-    try:
-        x = float(x)
-    except (TypeError, ValueError):
-        return 0.0
-    return 0.0 if x < 0 else (1.0 if x > 1 else x)
 
 
 # ── Per-signal vote builders (pure; primitive inputs) ────────────────────────────

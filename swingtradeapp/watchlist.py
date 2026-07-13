@@ -1,9 +1,9 @@
 """Watchlist management with persistence to JSON."""
 
-import json
-import os
 from typing import List, Dict, Optional
 from pathlib import Path
+
+from .jsonstore import atomic_write_json, read_json
 
 
 class WatchlistManager:
@@ -19,35 +19,19 @@ class WatchlistManager:
     
     def _load_watchlists(self) -> None:
         """Load watchlists from JSON file."""
-        if self.watchlists_file.exists():
-            try:
-                with open(self.watchlists_file, 'r') as f:
-                    self.watchlists = json.load(f)
-            except Exception:
-                self.watchlists = {'Default': []}
-        else:
-            self.watchlists = {'Default': []}
-    
+        self.watchlists = read_json(self.watchlists_file, default={'Default': []})
+
     def _load_alerts(self) -> None:
         """Load price alerts from JSON file."""
-        if self.alerts_file.exists():
-            try:
-                with open(self.alerts_file, 'r') as f:
-                    self.alerts = json.load(f)
-            except Exception:
-                self.alerts = {}
-        else:
-            self.alerts = {}
-    
+        self.alerts = read_json(self.alerts_file, default={})
+
     def _save_watchlists(self) -> None:
         """Save watchlists to JSON file."""
-        with open(self.watchlists_file, 'w') as f:
-            json.dump(self.watchlists, f, indent=2)
-    
+        atomic_write_json(self.watchlists_file, self.watchlists)
+
     def _save_alerts(self) -> None:
         """Save alerts to JSON file."""
-        with open(self.alerts_file, 'w') as f:
-            json.dump(self.alerts, f, indent=2)
+        atomic_write_json(self.alerts_file, self.alerts)
     
     def create_watchlist(self, name: str) -> None:
         """Create a new watchlist."""

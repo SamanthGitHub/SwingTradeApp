@@ -29,6 +29,7 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
+from .num import clip01 as _clip01, ema as _ema
 from .signals import compute_rsi
 
 
@@ -52,22 +53,6 @@ class RallyConfig:
     # Exclusion gates — these aren't "about to start", so drop them.
     rsi_overbought: float = 78.0    # already extended
     max_down_day: float = -4.0      # selling off hard today
-
-
-def _clip01(x: float) -> float:
-    return 0.0 if x < 0 else 1.0 if x > 1 else x
-
-
-def _ema(values: np.ndarray, period: int) -> np.ndarray:
-    """Exponential moving average over an array (same length as input)."""
-    if len(values) == 0:
-        return values
-    alpha = 2.0 / (period + 1.0)
-    out = np.empty_like(values, dtype=float)
-    out[0] = values[0]
-    for i in range(1, len(values)):
-        out[i] = alpha * values[i] + (1 - alpha) * out[i - 1]
-    return out
 
 
 def _bb_width_series(closes: np.ndarray, period: int) -> np.ndarray:

@@ -14,12 +14,13 @@ multiple browser tabs sharing one Streamlit process.
 
 from __future__ import annotations
 
-import json
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+from .jsonstore import atomic_write_json, read_json
 
 
 @dataclass(frozen=True)
@@ -65,18 +66,15 @@ class ApiBudget:
 
     # ── internal io ──────────────────────────────────────────────────────────
     def _load(self) -> Dict[str, List[float]]:
+        data = read_json(self.path, default={})
         try:
-            with open(self.path) as f:
-                data = json.load(f)
             return {k: [float(t) for t in v] for k, v in data.items()}
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             return {}
 
     def _save(self, data: Dict[str, List[float]]) -> None:
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.path, "w") as f:
-                json.dump(data, f)
+            atomic_write_json(self.path, data, indent=0)
         except Exception:
             pass
 
@@ -117,6 +115,33 @@ class ApiBudget:
                 continue
             if self._count_within(ts, now, window) + n > limit:
                 return False, f"{spec.name} {label} limit ({limit}/{label})"
+        return True, ""
+
+    def try_acquire(self, provider: str, n: int = 1) -> Tuple[bool, str]:
+        """Atomically check-and-record ``n`` calls: the load → prune → check → record → save
+        sequence runs under one lock, so two threads can never both pass a ``check()`` and
+        together breach a window (the TOCTOU gap between separate ``check``/``record`` calls).
+        This is what providers must call immediately before a metered request.
+
+        Returns ``(acquired, reason)``; on ``False`` nothing was recorded.
+        """
+        spec = PROVIDERS.get(provider)
+        if spec is None:
+            return True, ""
+        now = time.time()
+        with self._lock:
+            data = self._load()
+            ts = self._prune(data.get(provider, []), now)
+            for window, limit, label in ((_MINUTE, spec.per_minute, "minute"),
+                                         (_DAY, spec.per_day, "day"),
+                                         (_MONTH, spec.per_month, "month")):
+                if limit is None:
+                    continue
+                if self._count_within(ts, now, window) + n > limit:
+                    return False, f"{spec.name} {label} limit ({limit}/{label})"
+            ts.extend([now] * max(1, n))
+            data[provider] = ts
+            self._save(data)
         return True, ""
 
     def record(self, provider: str, n: int = 1) -> None:

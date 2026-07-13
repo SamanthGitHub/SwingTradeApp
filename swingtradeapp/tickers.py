@@ -5,76 +5,38 @@ The live universe is fetched dynamically (see ``get_sp500_universe``); the stati
 and the on-disk cache are both unavailable.
 """
 
-# Offline fallback only — the live S&P 500 list is fetched at runtime.
+# Offline fallback only — the live universe is fetched at runtime. Deduped, currently-listed,
+# liquid large/mid caps (last audited July 2026); delisted/renamed names were purged (SIVB,
+# CRAY, BRCM, FISV, SQ, XLRN, CONE, BOOKING, …) along with ETFs and bogus symbols.
 MAJOR_US_STOCKS = [
-    # Tech Megacap
-    'AAPL', 'MSFT', 'AMZN', 'GOOGL', 'NVDA', 'TSLA', 'META', 'AVGO', 'ASML', 'COST',
+    # Tech megacap & software
+    'AAPL', 'MSFT', 'AMZN', 'GOOGL', 'NVDA', 'TSLA', 'META', 'AVGO', 'ORCL', 'COST',
     'NFLX', 'ADBE', 'CRM', 'INTC', 'AMD', 'MU', 'LRCX', 'MRVL', 'MCHP', 'QCOM',
-    'INTU', 'SNPS', 'CDNS', 'PAYX', 'PZZA', 'BKNG', 'PYPL', 'ZM', 'NETS', 'CORN',
-    
-    # Financial Services
-    'JPM', 'BAC', 'WFC', 'GS', 'MS', 'BLK', 'SCHW', 'TD', 'RY', 'CM',
-    'AXON', 'AIG', 'HIG', 'PGR', 'MKL', 'RLI', 'TFIN', 'IYF', 'VFV', 'CRAY',
-    'DFS', 'COF', 'SYF', 'PAYC', 'ADYEY', 'ADYEN', 'SQ', 'FISV', 'FIS', 'JKHY',
-    
-    # Energy & Materials
+    'INTU', 'SNPS', 'CDNS', 'NOW', 'BKNG', 'PYPL', 'UBER', 'SHOP', 'PLTR', 'ANET',
+    'TSM', 'ASML', 'SMCI', 'ENTG', 'MKSI', 'ANSS', 'OKTA', 'NET', 'GTLB', 'AKAM',
+    # Financials & payments
+    'JPM', 'BAC', 'WFC', 'GS', 'MS', 'BLK', 'SCHW', 'C', 'USB', 'PNC',
+    'AXP', 'V', 'MA', 'CME', 'ICE', 'PGR', 'AIG', 'HIG', 'MKL', 'SOFI',
+    'DFS', 'COF', 'SYF', 'PAYC', 'FIS', 'JKHY', 'GPN', 'WEX', 'PAYX', 'BRK-B',
+    # Energy & materials
     'XOM', 'CVX', 'COP', 'MPC', 'PSX', 'VLO', 'OXY', 'EOG', 'SLB', 'HAL',
-    'FANG', 'PARAA', 'APA', 'BST', 'METC', 'USU', 'FCX', 'SCCO', 'NEM', 'GFI',
-    'ALB', 'LIT', 'LAC', 'SQM', 'CMMC', 'MP', 'FSI', 'UEC', 'SPRQ', 'CCJC',
-    
-    # Consumer & Retail
-    'PG', 'UL', 'KO', 'MO', 'PM', 'EL', 'CLX', 'CHD', 'KMB', 'CPRT',
-    'WMT', 'TGT', 'KSS', 'M', 'BBY', 'DLTR', 'FIVE', 'RCL', 'CCL', 'MAR',
-    'AMZN', 'EBAY', 'ETSY', 'SHOP', 'JMIA', 'MWG', 'BABA', 'PDD', 'SE', 'GRAB',
-    
-    # Healthcare & Pharma
+    'FANG', 'APA', 'FCX', 'SCCO', 'NEM', 'ALB', 'SQM', 'MP', 'CAT', 'MOS',
+    # Consumer & retail
+    'PG', 'KO', 'PEP', 'PM', 'MO', 'EL', 'CLX', 'CHD', 'KMB', 'MDLZ',
+    'WMT', 'TGT', 'HD', 'LOW', 'BBY', 'DLTR', 'FIVE', 'RCL', 'CCL', 'MAR',
+    'EBAY', 'ETSY', 'BABA', 'PDD', 'SE', 'ABNB', 'EXPE', 'MNST', 'STZ', 'KR',
+    # Healthcare & pharma
     'JNJ', 'UNH', 'LLY', 'PFE', 'ABBV', 'MRK', 'BMY', 'AZN', 'AMGN', 'GILD',
-    'BIIB', 'VRTX', 'XLRN', 'BMRN', 'REGN', 'ALNY', 'ILMN', 'EXAS', 'DXCM', 'CVS',
-    'UHS', 'HCA', 'LPLA', 'LH', 'DGX', 'LABS', 'XRAY', 'GMED', 'CSTL', 'CRVS',
-    
-    # Payments & FinTech
-    'V', 'MA', 'AXP', 'DD', 'STWD', 'CME', 'ICE', 'INTC', 'AKAM', 'ANET',
-    'SSNC', 'SS', 'TRMB', 'EPAY', 'GPN', 'WEX', 'FLYW', 'TLIS', 'GTLB', 'PAYO',
-    
-    # Utilities & Infrastructure
-    'NEE', 'DUK', 'SO', 'EXC', 'AEP', 'XEL', 'LNT', 'CMS', 'WEC', 'DOK',
-    'AEE', 'PPL', 'ETR', 'IBM', 'GIS', 'IEX', 'DTE', 'EIX', 'PCG', 'FE',
-    
-    # Real Estate & Infrastructure
-    'AMT', 'PLD', 'CCI', 'EQIX', 'DLR', 'CONE', 'SBA', 'STAG', 'SITC', 'IRM',
-    'PSA', 'EQR', 'AVB', 'SPG', 'WY', 'UMH', 'NHI', 'LCRT', 'LADR', 'GET',
-    
-    # Aerospace & Defense
-    'BA', 'LMT', 'RTX', 'NOC', 'GD', 'LDOS', 'HII', 'KTOS', 'TXT', 'MOD',
-    
-    # Insurance
-    'BRK.B', 'BRK.A', 'TRMB', 'SOFI', 'SLV', 'SIVB', 'PACB', 'SBLK', 'KRBN', 'TMHC',
-    
-    # Semiconductors & Components
-    'TSM', 'QCOM', 'BRCM', 'AVGO', 'MU', 'TMDX', 'LRCX', 'SMCI', 'MKSI', 'ENTG',
-    'ANSS', 'SNPS', 'CDNS', 'VEEV', 'DESK', 'MSFT', 'AMZN', 'PYPL', 'OKTA', 'NET',
-    
-    # Industrial & Manufacturing  
-    'CAT', 'BA', 'GE', 'MMM', 'HON', 'ITW', 'PH', 'PCAR', 'NDSN', 'IR',
-    'WM', 'ROL', 'RSG', 'GES', 'TWO', 'EXC', 'AES', 'EOG', 'MOS', 'ADM',
-    
-    # Telecommunications
-    'VZ', 'T', 'TMUS', 'CMCSA', 'CHTR', 'DTM', 'LBRDK', 'LBRDA', 'VOD', 'TMUS',
-    
-    # Transportation & Logistics
-    'UPS', 'FDX', 'XPO', 'KNX', 'CAR', 'J', 'KEX', 'JBLU', 'LUV', 'DAL',
-    'UAL', 'AAL', 'ULCC', 'SAVE', 'SKYW', 'EXPE', 'BOOKING', 'TRIP', 'ABNB', 'LYFT',
-    
-    # Chemicals & Materials
-    'LYB', 'DOW', 'CE', 'APD', 'ECL', 'IFF', 'CTVA', 'BALL', 'PKG', 'IP',
-    'AMCR', 'HUN', 'OLN', 'AXTA', 'SHW', 'SCKT', 'AXTO', 'RPAY', 'TCBI', 'PFSI',
-    
-    # Food & Beverage
-    'KO', 'PEP', 'MO', 'PM', 'TAP', 'STZ', 'DEO', 'BUD', 'MNST', 'FIZZ',
-    'CPRI', 'KR', 'SJM', 'K', 'GIS', 'CAG', 'MDLZ', 'NSRGY', 'EL', 'ITC',
-    
-    # Consumer Staples & Discretionary
-    'WMT', 'TGT', 'DLTR', 'FIVE', 'KSS', 'AMZN', 'HD', 'LOW', 'BBY', 'AAPL',
+    'BIIB', 'VRTX', 'BMRN', 'REGN', 'ALNY', 'ILMN', 'EXAS', 'DXCM', 'CVS', 'HCA',
+    'UHS', 'LH', 'DGX', 'ISRG', 'MDT', 'TMO', 'DHR', 'ABT', 'SYK', 'BSX',
+    # Industrials, defense & transport
+    'BA', 'LMT', 'RTX', 'NOC', 'GD', 'LDOS', 'HII', 'TXT', 'AXON', 'GE',
+    'MMM', 'HON', 'ITW', 'PH', 'PCAR', 'NDSN', 'IR', 'WM', 'RSG', 'ADM',
+    'UPS', 'FDX', 'XPO', 'KNX', 'LUV', 'DAL', 'UAL', 'AAL', 'JBLU', 'CPRT',
+    # Utilities, telecom & real estate
+    'NEE', 'DUK', 'SO', 'EXC', 'AEP', 'XEL', 'WEC', 'ETR', 'PCG', 'FE',
+    'VZ', 'T', 'TMUS', 'CMCSA', 'CHTR', 'IBM', 'AMT', 'PLD', 'CCI', 'EQIX',
+    'DLR', 'IRM', 'PSA', 'EQR', 'AVB', 'SPG', 'O', 'WY', 'SHW', 'APD',
 ]
 
 import json
@@ -83,6 +45,7 @@ import re
 import time
 from pathlib import Path
 
+from .jsonstore import atomic_write_json
 from .retry import with_retry
 
 logger = logging.getLogger(__name__)
@@ -180,8 +143,7 @@ def _read_cache() -> list:
 
 def _write_cache(symbols: list) -> None:
     try:
-        _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _CACHE_PATH.write_text(json.dumps({"fetched_at": time.time(), "symbols": symbols}))
+        atomic_write_json(_CACHE_PATH, {"fetched_at": time.time(), "symbols": symbols}, indent=0)
     except Exception:
         logger.debug("Could not persist universe cache", exc_info=True)
 

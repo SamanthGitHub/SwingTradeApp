@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .config import TradingConfig
+from .jsonstore import atomic_write_json
 from .signals import Signal
 
 logger = logging.getLogger(__name__)
@@ -200,13 +201,11 @@ class BayesianKellySizer:
 
     def _save_state(self) -> None:
         try:
-            Path(".data").mkdir(exist_ok=True)
-            with open(self._state_path(), "w") as f:
-                json.dump({
-                    "daily_pnl": self.portfolio.daily_pnl,
-                    "halted": self.portfolio.halted,
-                    "open_positions": self.portfolio.open_positions,
-                }, f, indent=2)
+            atomic_write_json(self._state_path(), {
+                "daily_pnl": self.portfolio.daily_pnl,
+                "halted": self.portfolio.halted,
+                "open_positions": self.portfolio.open_positions,
+            })
         except Exception:
             pass
 

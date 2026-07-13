@@ -15,6 +15,8 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
+from .num import clip01 as _clip01
+
 
 @dataclass
 class WhaleConfig:
@@ -31,10 +33,6 @@ class WhaleConfig:
     w_rvol: float = 50.0
     w_dollar: float = 30.0
     w_impact: float = 20.0
-
-
-def _clip01(x: float) -> float:
-    return 0.0 if x < 0 else 1.0 if x > 1 else x
 
 
 def _classify(change_pct: float, close_strength: float, accumulation_days: int,

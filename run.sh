@@ -45,7 +45,15 @@ if [ ! -f "$STAMP" ]; then
   touch "$STAMP"
 fi
 
-# ── 4. Launch (or just verify, under SETUP_ONLY) ─────────────────────────────────
+# ── 4. First-launch nicety: pre-seed Streamlit credentials so the app never blocks
+# on the interactive "enter your email" prompt (a desktop-launcher run has no one
+# typing at stdin — without this the first launch appears to hang).
+if [ ! -f "${HOME}/.streamlit/credentials.toml" ]; then
+  mkdir -p "${HOME}/.streamlit"
+  printf '[general]\nemail = ""\n' > "${HOME}/.streamlit/credentials.toml"
+fi
+
+# ── 5. Launch (or just verify, under SETUP_ONLY) ─────────────────────────────────
 if [ "${SETUP_ONLY:-0}" = "1" ]; then
   python -c "import streamlit, plotly, yfinance, pandas, numpy; print('✅ core imports OK')"
   echo "✅ Setup complete. venv: $VENV"

@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 import json
 from pathlib import Path
 
+from .jsonstore import atomic_write_json
+
 
 class FundamentalsExtractor:
     """Extract and cache fundamental data from yfinance."""
@@ -51,8 +53,7 @@ class FundamentalsExtractor:
         data['timestamp'] = datetime.now().isoformat()
         cache_path = self._get_cache_path(symbol)
         try:
-            with open(cache_path, 'w') as f:
-                json.dump(data, f)
+            atomic_write_json(cache_path, data, indent=0)
         except Exception:
             pass
     

@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from .config import TradingConfig
+from .num import ema as _ema  # canonical EMA (was a local copy; setups.py imports it from here)
 
 logger = logging.getLogger(__name__)
 
@@ -62,16 +63,6 @@ class VolumeAnomalyDetector:
             return bool(scores[-1] < -0.3)
         except Exception:
             return False
-
-
-def _ema(values: np.ndarray, period: int) -> np.ndarray:
-    """Exponential moving average."""
-    result = np.empty_like(values, dtype=float)
-    k = 2.0 / (period + 1)
-    result[0] = values[0]
-    for i in range(1, len(values)):
-        result[i] = values[i] * k + result[i - 1] * (1 - k)
-    return result
 
 
 def wilder_smooth(values: np.ndarray, period: int) -> np.ndarray:

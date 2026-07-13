@@ -28,6 +28,7 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
+from .num import clip01 as _clip01
 from .signals import _ema, compute_atr, compute_rsi, compute_volume_surge
 from .momentum_radar import _bb_width_series
 from .patterns import (
@@ -58,10 +59,6 @@ class SetupHit:
 
 def _sma(c: np.ndarray, window: int) -> float:
     return float(np.mean(c[-window:])) if len(c) >= window else float(np.mean(c))
-
-
-def _clip01(x: float) -> float:
-    return 0.0 if x < 0 else 1.0 if x > 1 else x
 
 
 class Setup:

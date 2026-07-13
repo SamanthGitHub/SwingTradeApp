@@ -101,20 +101,19 @@ class PolygonProvider(DataProviderBase):
         return bool(self.api_key)
 
     def _reserve(self) -> bool:
-        """Check the budget and, if a slot is free, reserve it (record the call up front).
+        """Atomically reserve a budget slot (record the call up front) before the request.
 
-        Reserving before the request guarantees we never exceed the cap even if the request
-        then fails or retries — we err toward under-using, never over.
+        Uses ``ApiBudget.try_acquire`` — one locked check-and-record, so concurrent callers
+        can never both slip through a full window. Reserving before the request guarantees
+        we never exceed the cap even if the request then fails — we err toward under-using,
+        never over.
         """
         if not self.available():
             return False
         if self.budget is None:
             return True
-        allowed, _ = self.budget.check("polygon")
-        if not allowed:
-            return False
-        self.budget.record("polygon")
-        return True
+        acquired, _ = self.budget.try_acquire("polygon")
+        return acquired
 
     def _get(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
         # Deliberately NOT wrapped in @with_retry: the ApiBudget is our rate control, and retrying
