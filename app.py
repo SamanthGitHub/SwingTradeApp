@@ -5,6 +5,7 @@ import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,8 +44,10 @@ from swingtradeapp.tickers import get_raw_screen, get_screening_universe, get_tr
 from swingtradeapp import ui
 from swingtradeapp import youtube as yt
 from swingtradeapp import alpha_engine, alpha_factors, alpha_ml, alpha_validation, datalake
+from swingtradeapp import analyst as analyst_mod
 from swingtradeapp import confluence as cf
 from swingtradeapp import pricestore
+from swingtradeapp.llm_local import OllamaClient
 from swingtradeapp import patterns as patterns_mod, setups as setups_mod, regime as regime_mod
 from swingtradeapp import analysis_guide as ag
 from swingtradeapp import insiders as ins
@@ -1426,6 +1429,138 @@ def render_ticker_news(symbol: str, config, max_items: int = 6) -> None:
         )
 
 
+# ── Analyst briefs (template-generated theses; see swingtradeapp/analyst.py) ─────
+
+@st.cache_data(ttl=900, show_spinner=False)
+def assemble_dossier(symbol: str, _config, use_forecast: bool = False,
+                     use_ml: bool = False):
+    """Gather everything the app knows about one ticker into an analyst Dossier (cached 15 min).
+
+    Reuses the same engines the screens use, single-symbol only — cheap when the price store
+    is warm. ``use_forecast``/``use_ml`` mirror the Settings AI toggles (plain args so they
+    participate in the cache key).
+    """
+    hist = fetch_symbol_history(symbol, days=400)
+    if hist.empty or len(hist) < 26:
+        return None
+    closes = _to_series(hist, "Close")
+    volumes = _to_series(hist, "Volume") if "Volume" in hist.columns else [0] * len(closes)
+    highs = _to_series(hist, "High") if "High" in hist.columns else closes
+    lows = _to_series(hist, "Low") if "Low" in hist.columns else closes
+    opens = _to_series(hist, "Open") if "Open" in hist.columns else closes
+
+    sig = get_signal_generator(_config).build_signal(
+        symbol, closes[-120:], volumes[-120:], highs=highs[-120:], lows=lows[-120:], min_score=0.0)
+    info = fetch_symbol_info(symbol)
+    try:
+        fund = get_fundamentals().get_fundamentals(symbol)
+    except Exception:
+        fund = {}
+    try:
+        sentiment = aggregate_news_sentiment(symbol, get_sentiment_analyzer(_config))
+    except Exception:
+        sentiment = {"positive_pct": None, "count": 0, "headlines": [], "events": []}
+
+    # Named setups + whale footprint straight from the pure detectors (no scan-cache dependency).
+    try:
+        hits = setups_mod.detect_all(opens, highs, lows, closes, volumes)
+    except Exception:
+        hits = []
+    try:
+        whale_row = WhaleDetector(WhaleConfig()).analyze(symbol, opens, highs, lows, closes, volumes)
+    except Exception:
+        whale_row = None
+
+    regime = None
+    try:
+        r = get_regime_read()
+        regime = {"verdict": r.verdict, "score": r.score, "drivers": list(r.drivers)}
+    except Exception:
+        pass
+
+    forecast = None
+    if use_forecast:
+        try:
+            forecast = get_forecaster().forecast(closes, horizon=1)
+        except Exception:
+            forecast = None
+
+    ml_prob = None
+    if use_ml and ML_MODEL_PATH.exists():
+        model = get_ml_signal_model()
+        if model is not None:
+            ml_prob = model.predict_proba(ml_signal.extract_features(closes, highs, lows, volumes))
+
+    md = sig.metadata if sig else {}
+    votes = {
+        "tech": cf.vote_tech(recommend_label(sig.score, sig.signal_type), sig.score) if sig else None,
+        "news": cf.vote_news((sentiment.get("positive_pct") or 0) * 100
+                             if sentiment.get("count") else None),
+        "whale": (cf.vote_whale(whale_row.get("signal"), whale_row.get("whale_score"))
+                  if whale_row else None),
+    }
+    conf_res = cf.score_ticker(votes)
+
+    heads = sentiment.get("headlines") or []
+    top_head = (heads[0].get("headline") if heads and isinstance(heads[0], dict)
+                else (heads[0] if heads else None))
+
+    return analyst_mod.Dossier(
+        symbol=symbol,
+        price=info.get("price") or float(closes[-1]),
+        change_pct=info.get("change_pct"),
+        name=info.get("name") or symbol,
+        sector=info.get("sector") or "",
+        signal_type=sig.signal_type if sig else None,
+        score=sig.score if sig else None,
+        rsi=md.get("rsi"), adx=md.get("adx"), macd_hist=md.get("macd_hist"),
+        vol_surge=md.get("vol_surge"), atr=md.get("atr"),
+        sma20=md.get("sma_20"), sma50=md.get("sma_50"), vwap=md.get("vwap"),
+        entry=sig.entry_price if sig else None,
+        stop=sig.stop_price if sig else None,
+        target=sig.target_price if sig else None,
+        reasons=list(md.get("reasons", [])),
+        setups=[{"name": h.name, "score": float(h.score), "reasons": list(h.reasons)}
+                for h in hits],
+        confluence=conf_res,
+        regime=regime,
+        whale=whale_row,
+        forecast=forecast,
+        news={"positive_pct": sentiment.get("positive_pct"), "count": sentiment.get("count", 0),
+              "top_headline": top_head, "events": list(sentiment.get("events", []))},
+        fundamentals={k: fund.get(k) for k in ("pe_ratio", "profit_margin", "roe",
+                                               "debt_to_equity", "market_cap")} if fund else None,
+        ml_prob=ml_prob,
+    )
+
+
+def render_analyst_brief(symbol: str, config, show_header: bool = True) -> None:
+    """The plain-English analyst-brief block: template-generated from the app's own signals,
+    optionally rephrased by a local Ollama LLM (Settings → Analyst briefs)."""
+    if not st.session_state.get("analyst_briefs", True):
+        return
+    d = assemble_dossier(symbol, config, use_forecast=_ai_on("ai_forecast"),
+                         use_ml=_ai_on("ai_ml_signal"))
+    if d is None:
+        return
+    brief = analyst_mod.build_brief(d)
+    md_text = analyst_mod.render_markdown(brief)
+    polished = False
+    if st.session_state.get("ollama_polish"):
+        client = OllamaClient(host=st.session_state.get("ollama_host", ""),
+                              model=st.session_state.get("ollama_model", ""))
+        with st.spinner("Polishing with local LLM…"):
+            out = client.polish(md_text, json.dumps(asdict(d), default=str))
+        if out:
+            md_text, polished = out, True
+    with st.container(border=True):
+        if show_header:
+            st.markdown("#### 🧠 Analyst brief")
+        st.markdown(md_text)
+        st.caption(("✨ Polished by local LLM (Ollama) · " if polished else "")
+                   + "Based on: " + (", ".join(brief.sources) or "price history only"))
+
+
 def render_ticker_analysis(symbol: str, config, account_size: float,
                            key_prefix: str = "search") -> None:
     """Full on-demand analysis for ANY ticker: signal, chart, levels, news, forecast."""
@@ -1476,6 +1611,8 @@ def render_ticker_analysis(symbol: str, config, account_size: float,
     m[2].metric("Vol surge", f"{sig.metadata.get('vol_surge', 0):.2f}x")
     if sig.metadata.get("reasons"):
         st.write("**Signal reasons:** " + "; ".join(sig.metadata["reasons"]))
+
+    render_analyst_brief(symbol, config)
 
     st.markdown(f"#### 📰 News for {symbol}")
     render_ticker_news(symbol, config)
@@ -2801,6 +2938,18 @@ def run_dashboard() -> None:
                 st.markdown(f"⚠️ Macro caution: {reason}")
             if nxt and nxt_days == 0:
                 st.markdown(f"📅 **{nxt[1]} today** — expect volatility; avoid fresh risk into it.")
+            if st.session_state.get("analyst_briefs", True):
+                try:
+                    reg = get_regime_read()
+                    mb = analyst_mod.market_brief(
+                        score, bias,
+                        {"verdict": reg.verdict, "score": reg.score, "drivers": list(reg.drivers)},
+                        vix, reg.breadth_pct,
+                        next_event=(nxt[1], nxt_days) if nxt else None)
+                    with st.container(border=True):
+                        st.markdown(analyst_mod.render_markdown(mb))
+                except Exception:
+                    pass
         except Exception:
             st.info("Market read unavailable right now.")
 
@@ -2956,6 +3105,10 @@ def run_dashboard() -> None:
                         "Entry": "${:.2f}", "Stop": "${:.2f}", "Target": "${:.2f}", "R:R": "{:.2f}x"},
                         na_rep="—").map(_reco_color, subset=["Reco"]),
                     use_container_width=True, hide_index=True)
+                if st.session_state.get("analyst_briefs", True):
+                    for _sym in list(view["Symbol"].head(3)):
+                        with st.expander(f"🧠 Analyst brief — {_sym}"):
+                            render_analyst_brief(_sym, config, show_header=False)
 
         # Evening / weekend: plan tomorrow with the next-session forecast.
         if data_session == "closed":
@@ -4727,6 +4880,7 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
                         st.markdown(f"- **{k.title()}** {arrow or '—'} · {det or '_no read_'}")
                     if r["Why"]:
                         st.success(f"Agreeing screens ({badge}): {r['Why']}")
+                    render_analyst_brief(pick, config)
 
             _render_legend()
 
@@ -5341,6 +5495,37 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
                      "back to the heuristic tidy when the model isn't installed.")
         st.caption("Forecast appears on Auto Watchlist + Screener drill-down; news AI on the "
                    "Screener drill-down; transcript cleanup on the YouTube screen.")
+
+        st.subheader("🧠 Analyst briefs")
+        st.session_state["analyst_briefs"] = st.checkbox(
+            "Plain-English analyst briefs (free, instant, template-generated)",
+            value=bool(st.session_state.get("analyst_briefs", True)),
+            help="A multi-paragraph trade thesis composed from the app's own signals — trend, "
+                 "smart money, trade plan, catalysts, risks. Appears on the Screener drill-down, "
+                 "Signal Stack drill-down and Morning Insights. No model download; can't "
+                 "hallucinate numbers because it only interpolates the app's own values.")
+        with st.expander("Optional: polish briefs with a local LLM (Ollama)"):
+            st.caption("Free and fully local. Install [Ollama](https://ollama.com), run "
+                       "`ollama pull llama3.2:3b`, then enable below. The LLM only *rephrases* the "
+                       "finished brief — it's instructed to add no numbers or claims — and any "
+                       "failure silently falls back to the template text.")
+            oc1, oc2 = st.columns(2)
+            with oc1:
+                st.session_state["ollama_host"] = st.text_input(
+                    "Ollama host", st.session_state.get("ollama_host", "http://localhost:11434"))
+            with oc2:
+                st.session_state["ollama_model"] = st.text_input(
+                    "Model", st.session_state.get("ollama_model", "llama3.2:3b"))
+            st.session_state["ollama_polish"] = st.checkbox(
+                "Polish analyst briefs with the local LLM",
+                value=bool(st.session_state.get("ollama_polish", False)))
+            if st.button("Test connection", key="ollama_test"):
+                client = OllamaClient(host=st.session_state.get("ollama_host", ""),
+                                      model=st.session_state.get("ollama_model", ""))
+                if client.available():
+                    st.success(f"Ollama is answering at {client.host} ✓")
+                else:
+                    st.error(f"No Ollama server at {client.host} — is `ollama serve` running?")
 
         st.markdown("**ML signal model** — uses scikit-learn (already installed; no extra download)")
         st.session_state["ai_ml_signal"] = st.checkbox(
