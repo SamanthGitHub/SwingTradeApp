@@ -3,6 +3,8 @@
 import json
 import math
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,6 +44,7 @@ from swingtradeapp import ui
 from swingtradeapp import youtube as yt
 from swingtradeapp import alpha_engine, alpha_factors, alpha_ml, alpha_validation, datalake
 from swingtradeapp import confluence as cf
+from swingtradeapp import pricestore
 from swingtradeapp import patterns as patterns_mod, setups as setups_mod, regime as regime_mod
 from swingtradeapp import analysis_guide as ag
 from swingtradeapp import insiders as ins
@@ -167,8 +170,11 @@ def _mark_capture(source: str) -> None:
 
 @with_retry()
 def _yf_download(symbol: str, start, end) -> pd.DataFrame:
+    # auto_adjust pinned: yfinance has flipped the default across versions, and the bulk
+    # path (_yf_download_bulk) must return identical price series to this fallback.
     _mark_capture("Yahoo · free")
-    return yf.download(symbol, start=start, end=end, progress=False, threads=False)
+    return yf.download(symbol, start=start, end=end, progress=False, threads=False,
+                       auto_adjust=True)
 
 
 @with_retry(retries=2)
@@ -177,18 +183,110 @@ def _yf_info(symbol: str) -> Dict:
     return t.info if hasattr(t, "info") else {}
 
 
-@st.cache_data(ttl=3600)
+_HISTORY_FIELDS = ["Open", "High", "Low", "Close", "Volume"]
+
+# Bulk-download chunk size. Large single calls get rate-limited by Yahoo and come back
+# half-empty; ≤40 names per request stays reliable (see also _download_field's 25).
+_BULK_CHUNK = 40
+_BULK_CHUNK_PAUSE_S = 0.25
+
+
 def fetch_symbol_history(symbol: str, days: int = 90) -> pd.DataFrame:
-    end = datetime.now()
+    """Daily bars for one symbol, served from the shared prefetch store when warm.
+
+    Scan pages warm the store in bulk via ``prefetch_histories`` (chunked multi-ticker
+    downloads), so per-symbol calls here are usually memory hits. A miss falls back to
+    the retry-wrapped single-symbol download and feeds the store for the next screen.
+    """
+    cached = pricestore.get(symbol, days)
+    if cached is not None:
+        return cached
+    end = _now_et().replace(tzinfo=None)
     start = end - timedelta(days=days)
     try:
         data = _yf_download(symbol, start, end)
         if data.empty:
             return pd.DataFrame()
-        cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in data.columns]
-        return data[cols].dropna()
+        if isinstance(data.columns, pd.MultiIndex):   # yfinance (Price, Ticker) shape
+            data = data.droplevel(1, axis=1)
+        cols = [c for c in _HISTORY_FIELDS if c in data.columns]
+        out = data[cols].dropna()
+        pricestore.put_many({symbol: out}, days)
+        return out.copy()
     except Exception:
         return pd.DataFrame()
+
+
+def _yf_download_bulk(symbols: List[str], days: int) -> Dict[str, pd.DataFrame]:
+    """One multi-ticker Yahoo download → per-symbol OHLCV frames (the bulk fast path).
+
+    Failed tickers come back as all-NaN column groups, not exceptions — they're dropped
+    here and counted by the caller. A fully-empty response is retried once.
+    """
+    end = _now_et().replace(tzinfo=None)
+    start = end - timedelta(days=days)
+    raw = pd.DataFrame()
+    for attempt in range(2):
+        try:
+            raw = yf.download(symbols, start=start, end=end, group_by="ticker",
+                              auto_adjust=True, progress=False, threads=True)
+        except Exception:
+            raw = pd.DataFrame()
+        if raw is not None and not raw.empty:
+            break
+        time.sleep(1.0)
+    out: Dict[str, pd.DataFrame] = {}
+    if raw is None or raw.empty:
+        return out
+    if isinstance(raw.columns, pd.MultiIndex):
+        available = set(raw.columns.get_level_values(0))
+        for sym in symbols:
+            if sym not in available:
+                continue
+            df = raw[sym]
+            cols = [c for c in _HISTORY_FIELDS if c in df.columns]
+            df = df[cols].dropna()
+            if not df.empty:
+                out[sym] = df
+    elif len(symbols) == 1:                            # single-name chunk → flat columns
+        cols = [c for c in _HISTORY_FIELDS if c in raw.columns]
+        df = raw[cols].dropna()
+        if not df.empty:
+            out[symbols[0]] = df
+    return out
+
+
+def prefetch_histories(symbols: List[str], days: int, label: str = "prices") -> tuple:
+    """Warm the price store for a scan: chunked multi-ticker downloads with a progress bar.
+
+    Main-thread only (drives ``st.progress``). Yahoo-only by design — Polygon stays on the
+    budgeted single-symbol path in ``fetch_history_ondemand``, so bulk scans can never touch
+    the paid 5/min cap. Returns ``(fetched_ok, failed)`` over the symbols actually missing.
+    """
+    todo = pricestore.missing(symbols, days)
+    if not todo:
+        return (0, 0)
+    chunks = [todo[i:i + _BULK_CHUNK] for i in range(0, len(todo), _BULK_CHUNK)]
+    progress = st.progress(0.0, text=f"Downloading {label} for {len(todo)} symbols…")
+    ok = 0
+    try:
+        for i, chunk in enumerate(chunks):
+            frames = _yf_download_bulk(chunk, days)
+            if frames:
+                pricestore.put_many(frames, days)
+                _mark_capture("Yahoo · free")
+                ok += len(frames)
+            progress.progress((i + 1) / len(chunks),
+                              text=f"Downloading {label}… {min((i + 1) * _BULK_CHUNK, len(todo))}/{len(todo)}")
+            if i + 1 < len(chunks):
+                time.sleep(_BULK_CHUNK_PAUSE_S)
+    finally:
+        progress.empty()
+    failed = len(todo) - ok
+    if failed > max(2, int(len(todo) * 0.10)):
+        st.caption(f"⚠ {failed} of {len(todo)} symbols returned no data (Yahoo throttling or "
+                   "delisted names) — they're skipped in this scan.")
+    return (ok, failed)
 
 
 def fetch_history_ondemand(symbol: str, days: int = 90):
@@ -260,10 +358,9 @@ def _persist_env(key: str, value: str) -> None:
         pass
 
 
-@st.cache_data(ttl=3600)
-def fetch_symbol_info(symbol: str) -> Dict:
+def _summarize_info(symbol: str, info: Dict) -> Dict:
+    """Raw yfinance ``info`` payload → the compact dict the UI uses. Pure (no network)."""
     try:
-        info = _yf_info(symbol)
         price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
         prev = info.get("previousClose")
         change = (price - prev) / prev * 100.0 if price and prev else info.get("regularMarketChangePercent")
@@ -281,6 +378,14 @@ def fetch_symbol_info(symbol: str) -> Dict:
         return {"sector": "Unknown", "industry": "Unknown", "price": None,
                 "change_pct": None, "market_cap": None,
                 "name": symbol, "summary": "", "website": ""}
+
+
+@st.cache_data(ttl=3600)
+def fetch_symbol_info(symbol: str) -> Dict:
+    try:
+        return _summarize_info(symbol, _yf_info(symbol))
+    except Exception:
+        return _summarize_info(symbol, {})
 
 
 @st.cache_data(ttl=600)
@@ -656,6 +761,7 @@ def scan_gate(key: str, recommended: str, clear=None) -> bool:
                     clear()
                 except Exception:
                     pass
+            pricestore.clear()  # "fresh data" includes prices — the prefetch re-warms in seconds
         return True
     if st.button("▶ Scan now", key=f"scanbtn_{key}", type="primary"):
         st.session_state[flag] = True
@@ -762,7 +868,7 @@ def predict_tomorrow(sample_size: int = 60) -> pd.DataFrame:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def scan_whale_activity(sample_size: int = 120, min_rvol: float = 2.0,
-                        min_dollar_vol_m: float = 50.0) -> pd.DataFrame:
+                        min_dollar_vol_m: float = 50.0, min_price: float = 5.0) -> pd.DataFrame:
     """Scan the most-active universe for large-money ("whale") footprints (cached 10 min).
 
     For each symbol we pull recent daily OHLCV and ask the WhaleDetector whether the latest
@@ -779,6 +885,8 @@ def scan_whale_activity(sample_size: int = 120, min_rvol: float = 2.0,
         if hist.empty or len(hist) < 24 or "Volume" not in hist.columns:
             continue
         closes = _to_series(hist, "Close")
+        if min_price and float(closes[-1]) < min_price:
+            continue
         volumes = _to_series(hist, "Volume")
         highs = _to_series(hist, "High") if "High" in hist.columns else closes
         lows = _to_series(hist, "Low") if "Low" in hist.columns else closes
@@ -793,7 +901,8 @@ def scan_whale_activity(sample_size: int = 120, min_rvol: float = 2.0,
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def scan_rally_radar(sample_size: int = 150, min_score: float = 45.0) -> pd.DataFrame:
+def scan_rally_radar(sample_size: int = 150, min_score: float = 45.0,
+                     min_price: float = 5.0) -> pd.DataFrame:
     """Scan the most-active universe for *early* / pre-breakout bullish setups (cached 10 min).
 
     Unlike the Screener (which rewards already-established trends), the RallyDetector looks for
@@ -809,6 +918,8 @@ def scan_rally_radar(sample_size: int = 150, min_score: float = 45.0) -> pd.Data
         if hist.empty or len(hist) < 60 or "Volume" not in hist.columns:
             continue
         closes = _to_series(hist, "Close")
+        if min_price and float(closes[-1]) < min_price:
+            continue
         records.append({
             "symbol": sym,
             "closes": closes,
@@ -849,12 +960,13 @@ def get_regime_read():
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def scan_setups(sample_size: int = 150) -> pd.DataFrame:
+def scan_setups(sample_size: int = 150, min_price: float = 5.0) -> pd.DataFrame:
     """Scan the most-active universe for every named setup (cached 10 min).
 
     For each symbol runs ``setups.detect_all`` (VCP, 20-EMA pullback, double bottom, liquidity
     sweep, RSI(2)) on ~1y of daily bars and records each hit with its entry/stop/target/R:R, a
-    quality score, a Fair-Value-Gap confluence tag and the reasons it fired.
+    quality score, a Fair-Value-Gap confluence tag and the reasons it fired. Sub-``min_price``
+    (penny) names are skipped unless the page's checkbox includes them.
     """
     universe = get_screen_universe()[:sample_size]
     rows: List[Dict] = []
@@ -863,6 +975,8 @@ def scan_setups(sample_size: int = 150) -> pd.DataFrame:
         if hist.empty or len(hist) < 60 or "Volume" not in hist.columns:
             continue
         closes = _to_series(hist, "Close")
+        if min_price and float(closes[-1]) < min_price:
+            continue
         opens = _to_series(hist, "Open") if "Open" in hist.columns else closes
         highs = _to_series(hist, "High") if "High" in hist.columns else closes
         lows = _to_series(hist, "Low") if "Low" in hist.columns else closes
@@ -1513,6 +1627,28 @@ def get_ml_signal_model(sample_size: int = 40):
 
 # ── Signal table ───────────────────────────────────────────────────────────────
 
+def _fetch_symbol_extras(symbol: str, fundamentals) -> tuple:
+    """(raw_info, fundamentals, headlines) for one symbol — plain network calls only.
+
+    Safe to run from worker threads: no Streamlit elements, no ``st.cache_*``, no ApiBudget.
+    Each piece degrades independently so one failed feed doesn't cost the others.
+    """
+    from swingtradeapp.nlp import _fetch_headlines
+    try:
+        info = _yf_info(symbol)
+    except Exception:
+        info = {}
+    try:
+        fund = fundamentals.get_fundamentals(symbol)
+    except Exception:
+        fund = {}
+    try:
+        heads = _fetch_headlines(symbol, 5)
+    except Exception:
+        heads = []
+    return info, fund, heads
+
+
 def build_signal_table(
     symbols: List[str],
     config,
@@ -1523,12 +1659,17 @@ def build_signal_table(
     include_backtest: bool = False,
     ml_model=None,
 ) -> pd.DataFrame:
+    """Two-pass scan. Pass 1 scores every symbol on (prefetched) price data and applies the
+    score gate — CPU-only when the price store is warm. Pass 2 fetches info/fundamentals/news
+    concurrently for the handful of survivors, then sentiment scoring (FinBERT) and position
+    sizing run back on the main thread."""
     trend_generator = get_signal_generator(config)
     position_sizer = get_sizer(config)
     analyzer = get_sentiment_analyzer(config)
     fundamentals = get_fundamentals()
 
-    rows = []
+    # Pass 1 — price-only signal generation + score gate.
+    survivors = []
     for symbol in symbols:
         try:
             history = fetch_symbol_history(symbol, days=120)
@@ -1543,9 +1684,28 @@ def build_signal_table(
             signal = trend_generator.build_signal(symbol, closes, volumes, highs=highs, lows=lows)
             if signal is None or signal.score < threshold:
                 continue
+            survivors.append((symbol, signal, closes, highs, lows, volumes))
+        except Exception:
+            continue
 
-            info = fetch_symbol_info(symbol)
-            fund = fundamentals.get_fundamentals(symbol)
+    # Pass 2 — concurrent info/fundamentals/news for survivors only (workers never touch st.*).
+    extras: Dict[str, tuple] = {}
+    if survivors:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(_fetch_symbol_extras, sym, fundamentals): sym
+                       for sym, *_ in survivors}
+            for fut in as_completed(futures):
+                sym = futures[fut]
+                try:
+                    extras[sym] = fut.result()
+                except Exception:
+                    extras[sym] = ({}, {}, [])
+
+    rows = []
+    for symbol, signal, closes, highs, lows, volumes in survivors:
+        try:
+            raw_info, fund, headlines = extras.get(symbol, ({}, {}, []))
+            info = _summarize_info(symbol, raw_info)
 
             # Fundamental filters
             if filters.get("min_market_cap"):
@@ -1565,7 +1725,7 @@ def build_signal_table(
             # not from this same window (which would be in-sample overfitting).
             bt = run_symbol_backtest(symbol, config, days=120) if include_backtest else None
 
-            sentiment = aggregate_news_sentiment(symbol, analyzer)
+            sentiment = aggregate_news_sentiment(symbol, analyzer, headlines=headlines)
 
             # Optional ML probability of an up move over the swing horizon (calibrated, OOS-trained).
             ml_prob = None
@@ -1856,21 +2016,32 @@ ALPHA_UNIVERSE = [
 ]
 
 
+_PANEL_SKIPPED_CHUNKS = {"n": 0}  # last _download_field run's silently-skipped chunk count
+
+
 def _download_field(symbols: list, years: int, field: str, chunk: int = 25) -> pd.DataFrame:
     """Download one OHLCV ``field`` as a wide (dates × symbols) frame, in chunks.
 
     Large single-call batches get rate-limited by Yahoo and return half-empty — chunking keeps each
-    request small and reliable, then we concat. A failed chunk is skipped, not fatal.
+    request small and reliable, then we concat. A failed chunk is retried once, then skipped (not
+    fatal); the skip count is surfaced on the Alpha Engine page via ``_PANEL_SKIPPED_CHUNKS``.
     """
     import yfinance as yf
     frames = []
+    skipped = 0
     for i in range(0, len(symbols), chunk):
         part = symbols[i:i + chunk]
-        try:
-            raw = yf.download(part, period=f"{years}y", auto_adjust=True, progress=False)
-        except Exception:
-            continue
+        raw = None
+        for attempt in range(2):
+            try:
+                raw = yf.download(part, period=f"{years}y", auto_adjust=True, progress=False)
+            except Exception:
+                raw = None
+            if raw is not None and not raw.empty:
+                break
+            time.sleep(1.0)
         if raw is None or raw.empty:
+            skipped += 1
             continue
         if isinstance(raw.columns, pd.MultiIndex):
             if field in raw.columns.get_level_values(0):
@@ -1879,6 +2050,7 @@ def _download_field(symbols: list, years: int, field: str, chunk: int = 25) -> p
             f = raw[[field]].copy()
             f.columns = part[:1]
             frames.append(f)
+    _PANEL_SKIPPED_CHUNKS["n"] = skipped
     if not frames:
         return pd.DataFrame()
     out = pd.concat(frames, axis=1)
@@ -2410,6 +2582,7 @@ def run_dashboard() -> None:
 
         tickers = get_screen_universe()
         scan_universe = tickers[:sample_size]
+        prefetch_histories(list(dict.fromkeys(scan_universe + tickers[:30])), 300, "screener data")
 
         # Calibrate Kelly priors once from out-of-sample walk-forward edge (cached 1h).
         with st.spinner("Calibrating position sizer (out-of-sample)…"):
@@ -2427,15 +2600,19 @@ def run_dashboard() -> None:
         else:
             st.caption("Sizer using default priors (insufficient out-of-sample trades to calibrate).")
 
+        if _ai_on("ai_ml_signal") and not ML_MODEL_PATH.exists():
+            prefetch_histories(tickers[:40], 400, "ML training data")
         ml_model = get_ml_signal_model() if _ai_on("ai_ml_signal") else None
         if _ai_on("ai_ml_signal") and ml_model is None:
             st.caption("ℹ️ ML signal model unavailable (training needs more data, or scikit-learn "
                        "is missing) — using the rule-based score only.")
 
+        _t0 = time.perf_counter()
         with st.spinner(f"Scanning {len(scan_universe)} symbols…"):
             df = build_signal_table(scan_universe, config, min_score, allocation_scale,
                                     account_size, filters, include_backtest=include_bt,
                                     ml_model=ml_model)
+        st.caption(f"⏱ Scanned {len(scan_universe)} symbols in {time.perf_counter() - _t0:.1f}s")
 
         if df.empty:
             st.warning("No signals passed filters. Lower the min score or expand the universe.")
@@ -2579,7 +2756,7 @@ def run_dashboard() -> None:
             if st.button("↻ Refresh", use_container_width=True, help="Pull fresh data"):
                 for _clear in (compute_market_mood.clear, fetch_movers.clear, fetch_afterhours.clear,
                                score_symbols.clear, names_headlines.clear, _spy_trend.clear,
-                               get_market_news.clear, predict_tomorrow.clear):
+                               get_market_news.clear, predict_tomorrow.clear, pricestore.clear):
                     try:
                         _clear()
                     except Exception:
@@ -2677,6 +2854,7 @@ def run_dashboard() -> None:
         pool = list(dict.fromkeys([*my_syms, *bull_movers[:20]]))
         scored = pd.DataFrame()
         if pool:
+            prefetch_histories(pool, 120, "morning-brief data")
             with st.spinner(f"Scoring {len(pool)} names…"):
                 scored = score_symbols(config, tuple(sorted(set(pool))))
 
@@ -2832,10 +3010,16 @@ def run_dashboard() -> None:
             rr_stage = st.selectbox("Stage", ["All", "Coiling", "Igniting", "Breaking out"],
                                     help="Coiling = earliest (still quiet); Breaking out = latest")
 
+        rr_penny = st.checkbox("Include sub-$5 names", value=False, key="rr_penny",
+                               help="Penny stocks are skipped by default — thin books make their signals unreliable")
         if not scan_gate("rallyradar", RECOMMENDED_TIMES["Rally Radar"], clear=scan_rally_radar.clear):
             st.stop()
+        prefetch_histories(get_screen_universe()[:rr_n], 160, "rally-radar data")
+        _t0 = time.perf_counter()
         with st.spinner("Scanning for igniting momentum…"):
-            rally = scan_rally_radar(sample_size=rr_n, min_score=float(rr_min))
+            rally = scan_rally_radar(sample_size=rr_n, min_score=float(rr_min),
+                                     min_price=0.0 if rr_penny else 5.0)
+        st.caption(f"⏱ Scanned {rr_n} symbols in {time.perf_counter() - _t0:.1f}s")
 
         if rally.empty:
             st.info("No early-momentum setups cleared the bar right now. Lower the minimum score "
@@ -3129,11 +3313,17 @@ def run_dashboard() -> None:
             w_dollar = st.slider("Min $ traded ($M)", 10, 500, 50, 10,
                                  help="Minimum dollar volume to count as whale size")
 
+        w_penny = st.checkbox("Include sub-$5 names", value=False, key="w_penny",
+                              help="Penny stocks are skipped by default — thin books make their signals unreliable")
         if not scan_gate("whale", RECOMMENDED_TIMES["Whale Movements"], clear=scan_whale_activity.clear):
             st.stop()
+        prefetch_histories(get_screen_universe()[:w_n], 60, "whale-scan data")
+        _t0 = time.perf_counter()
         with st.spinner("Scanning the tape for whale activity…"):
             whales = scan_whale_activity(sample_size=w_n, min_rvol=w_rvol,
-                                         min_dollar_vol_m=float(w_dollar))
+                                         min_dollar_vol_m=float(w_dollar),
+                                         min_price=0.0 if w_penny else 5.0)
+        st.caption(f"⏱ Scanned {w_n} symbols in {time.perf_counter() - _t0:.1f}s")
 
         if whales.empty:
             st.info("No whale-sized volume events right now. Lower the relative-volume or "
@@ -3431,8 +3621,11 @@ def run_dashboard() -> None:
 
         if not scan_gate("predictions", RECOMMENDED_TIMES["Predictions"], clear=predict_tomorrow.clear):
             st.stop()
+        prefetch_histories(get_screen_universe()[:pr_n], 200, "forecast data")
+        _t0 = time.perf_counter()
         with st.spinner("Forecasting tomorrow's moves…"):
             preds = predict_tomorrow(sample_size=pr_n)
+        st.caption(f"⏱ Forecast {pr_n} symbols in {time.perf_counter() - _t0:.1f}s")
 
         if preds.empty:
             st.warning("No forecasts available right now — the data feed may be unavailable.")
@@ -3538,6 +3731,10 @@ def run_dashboard() -> None:
                          clear=build_auto_watchlist.clear):
             st.stop()
         with st.spinner("Scanning bullish movers and building signals…"):
+            _movers = fetch_movers(top_n=60, min_change_pct=aw_min)  # cached; same call the builder makes
+            if not _movers.empty:
+                bulls = _movers[_movers["change_pct"] > 0].head(aw_n)
+                prefetch_histories(list(bulls["symbol"]), 120, "mover data")
             awl = build_auto_watchlist(config, top_n=aw_n, min_change_pct=aw_min,
                                        with_forecast=use_fc)
 
@@ -3696,6 +3893,10 @@ def run_dashboard() -> None:
             st.dataframe(cal, use_container_width=True, hide_index=True)
         else:
             st.caption("No scheduled events in the next 45 days.")
+        if macro.fomc_schedule_stale():
+            st.caption("⚠ The known FOMC schedule has run out — FOMC dates above are missing until "
+                       "the calendar in `swingtradeapp/macro_filters.py` is updated from "
+                       "federalreserve.gov (Jobs/CPI dates are generated and stay current).")
 
         # Live news scan across macro proxies.
         st.subheader("Live market-moving news")
@@ -4458,8 +4659,12 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
 
         if not scan_gate("signalstack", RECOMMENDED_TIMES["Signal Stack"], clear=build_signal_stack.clear):
             st.stop()
+        # 200d covers everything the stack fans out to (signals 120d, whale 60d, forecast 200d).
+        prefetch_histories(get_screen_universe()[:n], 200, "signal-stack data")
+        _t0 = time.perf_counter()
         with st.spinner(f"Stacking signals across {n} names (joins several scans)…"):
             stack = build_signal_stack(config, n)
+        st.caption(f"⏱ Stacked {n} names in {time.perf_counter() - _t0:.1f}s")
 
         if stack.empty:
             st.warning("No signals to stack right now — try a larger universe or refresh.")
@@ -4612,6 +4817,9 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
         else:
             with st.spinner("Loading market data…"):
                 prices = fetch_price_panel(universe, years)
+            if _PANEL_SKIPPED_CHUNKS["n"]:
+                st.caption(f"⚠ {_PANEL_SKIPPED_CHUNKS['n']} download chunk(s) failed after a retry "
+                           "and were skipped — the panel may be missing some names.")
             if advanced and not prices.empty and prices.shape[1] >= 10:
                 age = datalake.panel_age_hours(datalake.panel_key("prices", universe, years))
                 ds1, ds2 = st.columns([3, 1])
@@ -4896,10 +5104,15 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
             all_names = [s.name for s in setups_mod.ALL_SETUPS]
             ss_pick = st.multiselect("Setups to show", all_names, default=all_names)
 
+        ss_penny = st.checkbox("Include sub-$5 names", value=False, key="ss_penny",
+                               help="Penny stocks are skipped by default — thin books make their signals unreliable")
         if not scan_gate("setupscanner", RECOMMENDED_TIMES["Setup Scanner"], clear=scan_setups.clear):
             st.stop()
+        prefetch_histories(get_screen_universe()[:ss_n], 400, "setup-scan data")
+        _t0 = time.perf_counter()
         with st.spinner("Scanning for setups…"):
-            sdf = scan_setups(sample_size=ss_n)
+            sdf = scan_setups(sample_size=ss_n, min_price=0.0 if ss_penny else 5.0)
+        st.caption(f"⏱ Scanned {ss_n} symbols in {time.perf_counter() - _t0:.1f}s")
 
         if sdf.empty:
             st.info("No setups cleared the rules right now. Widen the universe, or wait for the "
@@ -4984,8 +5197,11 @@ summarization, novelty), each with a heuristic fallback. Off by default; toggle 
                        "here they're approximated by a tight bracket, so results are indicative.")
 
         if st.button("▶ Run backtest", type="primary", key="run_bt"):
+            prefetch_histories(bl_symbols, 800, "backtest data")
+            _t0 = time.perf_counter()
             with st.spinner(f"Backtesting {bl_setup} across {len(bl_symbols)} symbol(s)…"):
                 res = run_setup_backtest(bl_setup, bl_symbols)
+            st.caption(f"⏱ Backtested {len(bl_symbols)} symbol(s) in {time.perf_counter() - _t0:.1f}s")
             st.session_state["_bt_result"] = res
             st.session_state["_bt_label"] = f"{bl_setup} · {len(bl_symbols)} symbol(s)"
 

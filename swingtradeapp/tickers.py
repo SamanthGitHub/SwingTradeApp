@@ -259,8 +259,19 @@ def get_sp500_universe(force_refresh: bool = False) -> list:
     return get_tradable_universe(force_refresh=force_refresh)
 
 
-def filter_non_penny_stocks(tickers: list, min_price: float = 5.0) -> list:
-    """Filter out penny stocks (typically stocks under min_price)."""
-    # This would be used in conjunction with real price data
-    # For now, the MAJOR_US_STOCKS list already excludes penny stocks by definition
-    return tickers
+def filter_non_penny_stocks(tickers: list, min_price: float = 5.0,
+                            last_price: dict = None) -> list:
+    """Drop names whose last close is under ``min_price``.
+
+    ``last_price`` maps symbol → last close, from price data the caller already has in
+    hand (e.g. the prefetch store) — no network call is made here. Symbols without a
+    known price are kept, so a missing quote never silently shrinks the universe.
+    """
+    if not last_price:
+        return list(tickers)
+    kept = []
+    for t in tickers:
+        p = last_price.get(t)
+        if p is None or p >= min_price:
+            kept.append(t)
+    return kept

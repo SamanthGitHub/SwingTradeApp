@@ -59,47 +59,19 @@ class MacroContext:
     # ── Fed Calendar ───────────────────────────────────────────────────────────
 
     def _build_fed_calendar(self) -> List[Tuple[datetime, str]]:
-        """Hardcoded 2024-2025 Fed calendar (update annually)."""
-        return [
-            (datetime(2024, 1, 31), "FOMC Decision"),
-            (datetime(2024, 3, 20), "FOMC Decision"),
-            (datetime(2024, 5, 1), "FOMC Decision"),
-            (datetime(2024, 6, 18), "FOMC Decision"),
-            (datetime(2024, 7, 31), "FOMC Decision"),
-            (datetime(2024, 9, 18), "FOMC Decision"),
-            (datetime(2024, 11, 7), "FOMC Decision"),
-            (datetime(2024, 12, 18), "FOMC Decision"),
-            (datetime(2025, 1, 29), "FOMC Decision"),
-            (datetime(2025, 3, 19), "FOMC Decision"),
-            (datetime(2025, 5, 7), "FOMC Decision"),
-            (datetime(2025, 6, 18), "FOMC Decision"),
-            # CPI (second Tuesday of month)
-            (datetime(2024, 2, 13), "CPI Release"),
-            (datetime(2024, 3, 12), "CPI Release"),
-            (datetime(2024, 4, 10), "CPI Release"),
-            (datetime(2024, 5, 15), "CPI Release"),
-            (datetime(2024, 6, 12), "CPI Release"),
-            (datetime(2024, 7, 11), "CPI Release"),
-            (datetime(2024, 8, 14), "CPI Release"),
-            (datetime(2024, 9, 11), "CPI Release"),
-            (datetime(2024, 10, 10), "CPI Release"),
-            (datetime(2024, 11, 13), "CPI Release"),
-            (datetime(2024, 12, 11), "CPI Release"),
-            (datetime(2025, 1, 14), "CPI Release"),
-            # Jobs (first Friday of month)
-            (datetime(2024, 2, 2), "Jobs Report"),
-            (datetime(2024, 3, 8), "Jobs Report"),
-            (datetime(2024, 4, 5), "Jobs Report"),
-            (datetime(2024, 5, 3), "Jobs Report"),
-            (datetime(2024, 6, 7), "Jobs Report"),
-            (datetime(2024, 7, 5), "Jobs Report"),
-            (datetime(2024, 8, 2), "Jobs Report"),
-            (datetime(2024, 9, 6), "Jobs Report"),
-            (datetime(2024, 10, 4), "Jobs Report"),
-            (datetime(2024, 11, 1), "Jobs Report"),
-            (datetime(2024, 12, 6), "Jobs Report"),
-            (datetime(2025, 1, 10), "Jobs Report"),
-        ] + [(d, "FOMC Decision") for d in _FOMC_2026]
+        """Verified FOMC decision dates (update annually from federalreserve.gov).
+
+        Recurring Jobs/CPI releases are *generated*, not listed here — see
+        :meth:`get_upcoming_macro_events` — so only the FOMC schedule can go stale, and
+        :meth:`fomc_schedule_stale` flags when it has.
+        """
+        return [(d, "FOMC Decision") for d in _FOMC_2026]
+
+    def fomc_schedule_stale(self) -> bool:
+        """True when every known FOMC date is in the past — the hardcoded schedule needs a
+        refresh from federalreserve.gov (surfaced as a caption in the UI)."""
+        fomc = [d for d, name in self.fed_dates if "FOMC" in name]
+        return bool(fomc) and max(fomc) < datetime.now()
 
     # ── Upcoming events (programmatic; recurring releases generated on the fly) ──
 

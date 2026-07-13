@@ -376,9 +376,12 @@ def aggregate_news_sentiment(
     max_articles: int = 5,
     event_classifier: Optional["NewsEventClassifier"] = None,
     novelty_scorer: Optional["NewsNovelty"] = None,
+    headlines: Optional[List[str]] = None,
 ) -> Dict:
     """Fetch recent headlines for ``symbol`` and return aggregate sentiment.
 
+    When ``headlines`` is provided (e.g. pre-fetched concurrently by a scan), no network
+    call is made — only scoring runs, which keeps FinBERT usage on the caller's thread.
     When ``novelty_scorer`` is provided, recycled headlines are deduped before scoring.
     When ``event_classifier`` is provided, each headline is tagged with a market event
     and binary-risk flags (e.g. ``earnings_imminent``) are surfaced. Backward compatible:
@@ -387,7 +390,10 @@ def aggregate_news_sentiment(
     base = {"avg_score": 0.5, "positive_pct": 0.0, "count": 0, "headlines": [],
             "events": [], "event_flags": [], "novelty": 1.0, "unique_count": 0}
     try:
-        headlines = _fetch_headlines(symbol, max_articles)
+        if headlines is None:
+            headlines = _fetch_headlines(symbol, max_articles)
+        else:
+            headlines = list(headlines)[:max_articles]
 
         novelty, unique_count = 1.0, len(headlines)
         if novelty_scorer is not None and headlines:

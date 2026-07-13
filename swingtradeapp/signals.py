@@ -74,25 +74,69 @@ def _ema(values: np.ndarray, period: int) -> np.ndarray:
     return result
 
 
-def compute_rsi(closes: np.ndarray, period: int = 14) -> float:
-    """Wilder RSI — returns value for last bar."""
-    if len(closes) < period + 1:
-        return 50.0
+def wilder_smooth(values: np.ndarray, period: int) -> np.ndarray:
+    """Wilder's recursive moving average: ``s[i] = s[i-1] + (v[i] - s[i-1]) / period``.
+
+    Seeded with the simple mean of the first ``period`` values; positions before the seed
+    hold the seed so the output keeps the input's length.
+    """
+    values = np.asarray(values, dtype=float)
+    n = len(values)
+    out = np.empty(n, dtype=float)
+    if n == 0:
+        return out
+    if n <= period:
+        out[:] = float(np.mean(values))
+        return out
+    seed = float(np.mean(values[:period]))
+    out[:period] = seed
+    for i in range(period, n):
+        out[i] = out[i - 1] + (values[i] - out[i - 1]) / period
+    return out
+
+
+def compute_rsi_series(closes: np.ndarray, period: int = 14) -> np.ndarray:
+    """True Wilder RSI over the whole series, O(n). The warm-up (first ``period`` bars) pads
+    to a neutral 50.0 so the output aligns 1:1 with ``closes``."""
+    closes = np.asarray(closes, dtype=float)
+    n = len(closes)
+    if n < period + 1:
+        return np.full(n, 50.0)
     deltas = np.diff(closes)
     gains = np.where(deltas > 0, deltas, 0.0)
     losses = np.where(deltas < 0, -deltas, 0.0)
-    avg_gain = float(np.mean(gains[-period:]))
-    avg_loss = float(np.mean(losses[-period:]))
-    if avg_loss == 0:
-        return 100.0 if avg_gain > 0 else 50.0
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
+    avg_gain = wilder_smooth(gains, period)
+    avg_loss = wilder_smooth(losses, period)
+    rsi = np.where(avg_loss > 0,
+                   100.0 - 100.0 / (1.0 + np.divide(avg_gain, avg_loss,
+                                                    out=np.zeros_like(avg_gain),
+                                                    where=avg_loss > 0)),
+                   np.where(avg_gain > 0, 100.0, 50.0))
+    out = np.empty(n, dtype=float)
+    out[1:] = rsi
+    out[:period] = 50.0
+    return out
+
+
+def compute_rsi(closes: np.ndarray, period: int = 14) -> float:
+    """Wilder RSI — returns value for last bar."""
+    closes = np.asarray(closes, dtype=float)
+    if len(closes) < period + 1:
+        return 50.0
+    return float(compute_rsi_series(closes, period)[-1])
 
 
 def compute_adx(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> float:
-    """Average Directional Index — trend strength 0-100. >25 = strong trend."""
+    """Average Directional Index — trend strength 0-100 (>25 = strong trend).
+
+    Full Wilder construction: RMA-smoothed TR and ±DM → DI± → DX series → ADX = RMA of DX.
+    """
     if len(closes) < period * 2 + 1:
         return 20.0
+
+    highs = np.asarray(highs, dtype=float)
+    lows = np.asarray(lows, dtype=float)
+    closes = np.asarray(closes, dtype=float)
 
     # True Range
     tr = np.maximum(highs[1:] - lows[1:],
@@ -105,32 +149,39 @@ def compute_adx(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period:
     dn = np.where((lows[:-1] - lows[1:]) > (highs[1:] - highs[:-1]),
                   np.maximum(lows[:-1] - lows[1:], 0), 0)
 
-    # Smoothed averages
-    atr = np.mean(tr[-period:])
-    plus_di = 100.0 * np.mean(up[-period:]) / atr if atr > 0 else 0
-    minus_di = 100.0 * np.mean(dn[-period:]) / atr if atr > 0 else 0
+    atr = wilder_smooth(tr, period)
+    safe_atr = np.where(atr > 0, atr, 1.0)
+    plus_di = np.where(atr > 0, 100.0 * wilder_smooth(up, period) / safe_atr, 0.0)
+    minus_di = np.where(atr > 0, 100.0 * wilder_smooth(dn, period) / safe_atr, 0.0)
+    di_sum = plus_di + minus_di
+    dx = np.where(di_sum > 0, 100.0 * np.abs(plus_di - minus_di) / np.where(di_sum > 0, di_sum, 1.0), 0.0)
 
-    dx = 100.0 * abs(plus_di - minus_di) / (plus_di + minus_di) if (plus_di + minus_di) > 0 else 0
-    adx = np.mean([dx] * 5)  # Simplified; proper ADX needs smoothing
-    return float(min(adx, 100.0))
+    # DX is meaningful once the DI smoothing has seeded (index period-1 in the diff arrays).
+    adx = wilder_smooth(dx[period - 1:], period)
+    return float(min(adx[-1], 100.0))
 
 
-def compute_stoch_rsi(rsi_series: np.ndarray, period: int = 14) -> Tuple[float, float]:
-    """Stochastic RSI — momentum of RSI. Returns (stoch_rsi, signal_line)."""
-    if len(rsi_series) < period + 1:
+def compute_stoch_rsi(rsi_series: np.ndarray, period: int = 14,
+                      smooth_k: int = 3, smooth_d: int = 3) -> Tuple[float, float]:
+    """Stochastic RSI — momentum of RSI. Returns ``(%K, %D)``.
+
+    %K is the ``smooth_k``-SMA of the raw stochastic of RSI over ``period`` bars; %D (the
+    signal line) is the ``smooth_d``-SMA of %K — the standard construction.
+    """
+    rsi_series = np.asarray(rsi_series, dtype=float)
+    raw_needed = smooth_k + smooth_d - 1                  # raw stoch values for both smoothings
+    if len(rsi_series) < period + raw_needed:
         return 50.0, 50.0
 
-    rsi_min = np.min(rsi_series[-period:])
-    rsi_max = np.max(rsi_series[-period:])
-    rsi_range = rsi_max - rsi_min
-
-    if rsi_range == 0:
-        stoch = 50.0
-    else:
-        stoch = 100.0 * (rsi_series[-1] - rsi_min) / rsi_range
-
-    signal = 50.0  # Simplified; proper signal requires EMA of stoch
-    return float(stoch), float(signal)
+    raws: List[float] = []
+    for offset in range(raw_needed - 1, -1, -1):          # oldest → newest
+        end = len(rsi_series) - offset
+        window = rsi_series[end - period:end]
+        lo, hi = float(np.min(window)), float(np.max(window))
+        raws.append(50.0 if hi == lo else 100.0 * (float(window[-1]) - lo) / (hi - lo))
+    k_vals = [float(np.mean(raws[i:i + smooth_k])) for i in range(len(raws) - smooth_k + 1)]
+    d = float(np.mean(k_vals[-smooth_d:]))
+    return float(k_vals[-1]), d
 
 
 def compute_vwap(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray,
@@ -218,8 +269,8 @@ class TrendSignalGenerator:
         sma_20 = float(np.mean(c[-20:]))
         sma_50 = float(np.mean(c[-50:])) if len(c) >= 50 else sma_20
 
-        rsi = compute_rsi(c)
-        rsi_series = np.array([compute_rsi(c[:max(1, i-13)]) for i in range(len(c))])
+        rsi_series = compute_rsi_series(c)
+        rsi = float(rsi_series[-1])
         stoch_rsi, stoch_sig = compute_stoch_rsi(rsi_series)
         macd_val, macd_sig, macd_hist = compute_macd(c)
         bb_upper, bb_mid, bb_lower = compute_bollinger(c)
@@ -384,6 +435,7 @@ class TrendSignalGenerator:
             metadata={
                 "rsi": float(rsi),
                 "stoch_rsi": float(stoch_rsi),
+                "stoch_rsi_signal": float(stoch_sig),
                 "adx": float(adx),
                 "macd": float(macd_val),
                 "macd_signal": float(macd_sig),

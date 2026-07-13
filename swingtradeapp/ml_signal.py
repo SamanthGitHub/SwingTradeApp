@@ -33,6 +33,8 @@ from .signals import (
     compute_bollinger,
     compute_macd,
     compute_rsi,
+    compute_rsi_series,
+    compute_stoch_rsi,
     compute_volume_surge,
 )
 
@@ -42,6 +44,10 @@ logger = logging.getLogger(__name__)
 MIN_BARS = 60
 # Default swing horizon (sessions) the label looks forward over.
 DEFAULT_HORIZON = 5
+
+# Bumped whenever the meaning/distribution of a feature changes (e.g. the Wilder-smoothed ADX
+# rewrite). A saved model whose version differs is discarded so it retrains on current features.
+FEATURE_VERSION = 2
 
 # Fixed, ordered feature names — kept stable so a saved model and live prediction agree.
 FEATURE_NAMES: List[str] = [
@@ -67,13 +73,12 @@ FEATURE_NAMES: List[str] = [
 
 
 def _rsi_series(closes: np.ndarray, length: int = 14, period: int = 14) -> np.ndarray:
-    """The last ``length`` RSI values (for a cheap Stochastic-RSI), each computed causally."""
-    n = len(closes)
-    out = []
-    for k in range(length):
-        end = n - length + 1 + k
-        out.append(compute_rsi(closes[:end]) if end >= period + 1 else 50.0)
-    return np.asarray(out, dtype=float)
+    """The last ``length`` RSI values (for the Stochastic-RSI feature), computed causally
+    in one O(n) pass via :func:`signals.compute_rsi_series`."""
+    series = compute_rsi_series(np.asarray(closes, dtype=float), period)
+    if len(series) >= length:
+        return series[-length:]
+    return np.concatenate([np.full(length - len(series), 50.0), series])
 
 
 def extract_features(closes: Sequence[float], highs: Sequence[float], lows: Sequence[float],
@@ -111,7 +116,7 @@ def extract_features(closes: Sequence[float], highs: Sequence[float], lows: Sequ
     bb_up, bb_mid, bb_low = compute_bollinger(cc)
     bb_rng = bb_up - bb_low
     atr = compute_atr(hh, ll, cc)
-    stoch_rsi, _ = _stoch_from_series(_rsi_series(cc))
+    stoch_rsi, _ = compute_stoch_rsi(_rsi_series(cc, length=20))
 
     hi20 = float(np.max(hh[-20:]))
     lo20 = float(np.min(ll[-20:]))
@@ -141,16 +146,6 @@ def extract_features(closes: Sequence[float], highs: Sequence[float], lows: Sequ
     if not np.all(np.isfinite(arr)):
         return None
     return arr
-
-
-def _stoch_from_series(rsi_series: np.ndarray, period: int = 14):
-    if len(rsi_series) < 1:
-        return 50.0, 50.0
-    window = rsi_series[-period:]
-    rmin, rmax = float(np.min(window)), float(np.max(window))
-    rng = rmax - rmin
-    stoch = 100.0 * (rsi_series[-1] - rmin) / rng if rng > 0 else 50.0
-    return float(stoch), 50.0
 
 
 def forward_label(closes: Sequence[float], idx: int, horizon: int = DEFAULT_HORIZON,
@@ -286,7 +281,8 @@ class MLSignalModel:
         try:
             import joblib
             joblib.dump({"clf": self.clf, "feature_names": self.feature_names,
-                         "horizon": self.horizon, "metrics": self.metrics}, path)
+                         "horizon": self.horizon, "metrics": self.metrics,
+                         "feature_version": FEATURE_VERSION}, path)
             return True
         except Exception:
             return False
@@ -301,8 +297,12 @@ class MLSignalModel:
             m.feature_names = blob.get("feature_names", list(FEATURE_NAMES))
             m.horizon = blob.get("horizon", DEFAULT_HORIZON)
             m.metrics = blob.get("metrics", {})
-            # A model trained on a different feature set is unusable — treat as absent.
+            # A model trained on a different feature set — or on an older *version* of the
+            # same features (their distributions changed) — is unusable; treat as absent so
+            # the caller retrains on current features.
             if m.feature_names != list(FEATURE_NAMES):
+                return None
+            if blob.get("feature_version") != FEATURE_VERSION:
                 return None
             return m
         except Exception:
